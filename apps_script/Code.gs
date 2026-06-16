@@ -1,11 +1,16 @@
 /**
- * Loest den GitHub-Actions-Workflow aus, wenn sich das Google Sheet aendert.
+ * Loest den GitHub-Actions-Workflow aus, wenn eine neue Formular-Antwort eingeht.
  *
  * Funktionsweise:
- *   Bei jeder Bearbeitung schickt das Skript einen POST an die
+ *   Die Tabelle ist eine Google-Form-Ergebnistabelle. Bei jeder
+ *   Formularuebermittlung schickt das Skript einen POST an die
  *   repository_dispatch-API von GitHub (event_type "sheet-updated"). Der
  *   Workflow .github/workflows/build-heatmap.yml reagiert darauf und baut die
  *   Heatmap neu.
+ *
+ *   Wichtig: Formular-Antworten loesen KEINEN onEdit-Trigger aus (onEdit feuert
+ *   nur bei manuellen Zellbearbeitungen). Daher reagiert dieses Skript auf
+ *   onFormSubmit.
  *
  * Einrichtung (einmalig):
  *   1. Im Sheet:  Erweiterungen -> Apps Script  -> diesen Code einfuegen.
@@ -15,10 +20,11 @@
  *      mit der Berechtigung "Contents: Read and write" (noetig fuer
  *      repository_dispatch). Der Token steht bewusst NICHT im Code.
  *   3. Trigger (Uhr-Symbol) -> Trigger hinzufuegen:
- *        Funktion: onSheetEdit
- *        Ereignis: Aus Tabelle / Bei Bearbeitung   (INSTALLIERBARER Trigger!)
- *      Wichtig: der einfache onEdit-Trigger darf KEINE externen Aufrufe
- *      (UrlFetchApp) machen - daher einen installierbaren Trigger anlegen.
+ *        Funktion:      onFormSubmit
+ *        Ereignisquelle: Aus Tabelle
+ *        Ereignistyp:   Bei Formularuebermittlung   (INSTALLIERBARER Trigger!)
+ *      Nur installierbare Trigger duerfen externe Aufrufe (UrlFetchApp) mit
+ *      Autorisierung machen.
  */
 
 // Repo ist oeffentlich -> Owner/Name duerfen im Code stehen.
@@ -26,19 +32,20 @@ var GITHUB_OWNER = 'TomBuZi';
 var GITHUB_REPO = 'location_heatmap';
 var EVENT_TYPE = 'sheet-updated';
 
-// Mindestabstand zwischen zwei Ausloesungen (Debounce), in Millisekunden.
-// onEdit feuert bei jeder Zelle - so vermeiden wir einen Lauf-Sturm.
-var MIN_INTERVAL_MS = 5 * 60 * 1000; // 5 Minuten
-
 /**
- * Trigger-Ziel: bei Bearbeitung des Sheets aufgerufen.
+ * Trigger-Ziel: bei jeder Formularuebermittlung aufgerufen.
  */
-function onSheetEdit(e) {
+function onFormSubmit(e) {
   triggerHeatmapBuild();
 }
 
 /**
- * Sendet repository_dispatch an GitHub - mit Debounce ueber Skripteigenschaften.
+ * Sendet repository_dispatch an GitHub.
+ *
+ * Kein Debounce: jede Formular-Antwort loest genau einen Build aus, damit die
+ * Karte immer die juengste Antwort enthaelt. (Falls je sehr viele gleichzeitige
+ * Antworten zu viel Build-Last erzeugen, waere der Upgrade ein zeitgesteuerter,
+ * nachlaufender Rebuild ueber einen zweiten Trigger.)
  */
 function triggerHeatmapBuild() {
   var props = PropertiesService.getScriptProperties();
@@ -46,14 +53,6 @@ function triggerHeatmapBuild() {
   var token = props.getProperty('GITHUB_TOKEN');
   if (!token) {
     Logger.log('Abbruch: Skripteigenschaft GITHUB_TOKEN fehlt.');
-    return;
-  }
-
-  // Debounce: hoechstens alle MIN_INTERVAL_MS ausloesen.
-  var now = new Date().getTime();
-  var last = Number(props.getProperty('LAST_DISPATCH_MS') || 0);
-  if (now - last < MIN_INTERVAL_MS) {
-    Logger.log('Debounce aktiv - kein Dispatch (letzter vor %s ms).', now - last);
     return;
   }
 
@@ -73,7 +72,6 @@ function triggerHeatmapBuild() {
   var response = UrlFetchApp.fetch(url, options);
   var code = response.getResponseCode();
   if (code === 204) {
-    props.setProperty('LAST_DISPATCH_MS', String(now));
     Logger.log('Dispatch ok (204) - Workflow ausgeloest.');
   } else {
     Logger.log('Dispatch fehlgeschlagen (%s): %s', code, response.getContentText());

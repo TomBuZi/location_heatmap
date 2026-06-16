@@ -84,11 +84,11 @@ Das Repo enthält einen Workflow (`.github/workflows/build-heatmap.yml`), der di
 der Cloud baut und auf **GitHub Pages** veröffentlicht. Die Sheets-URL liegt dabei als
 Repository-Secret `SHEET_URL` (nicht im Code), die veröffentlichte HTML enthält nur
 aggregierte Werte. Auslöser: Push auf `main`, manueller Button und `repository_dispatch`
-(vom Google Apps Script in `apps_script/Code.gs`, das bei Sheet-Änderungen feuert).
+(vom Google Apps Script in `apps_script/Code.gs`, das bei jeder Formular-Antwort feuert).
 
 Einrichtung: Secret `SHEET_URL` setzen, Pages-Quelle auf „GitHub Actions" stellen,
-Apps Script samt `GITHUB_TOKEN` und installierbarem Bearbeitungs-Trigger einrichten
-(Details in `apps_script/Code.gs`).
+Apps Script samt `GITHUB_TOKEN` und installierbarem Trigger „Bei Formularübermittlung"
+(`onFormSubmit`) einrichten (Details in `apps_script/Code.gs`).
 
 ## Eingabeformat
 
