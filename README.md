@@ -60,6 +60,12 @@ den Heatmap-Rasterzellen** – gesteuert durch dieselbe `--resolution-km`. Eine 
 Auflösung erzeugt daher viele Tooltip-Zellen und große HTML-Dateien; das Programm warnt
 ab ~50.000 Zellen.
 
+Die Karte enthält zwei umschaltbare Heatmap-Ebenen (Layer-Steuerung oben rechts):
+**„gewichtet"** (Default, mit `value_empty`/`value_filled`) und **„ungewichtet"**
+(standardmäßig ausgeblendet, jeder Datensatz zählt 1). Jede Ebene hat eigene Tooltips
+und eine eigene Farbskala. Die Info-Box unten links zeigt u. a. die Zahl der
+**Datensätze** (verwendet von gesamt eingelesen).
+
 ## Konfiguration (`config.toml`)
 
 Abweichungen vom Default lassen sich dauerhaft in `config.toml` ablegen, statt sie bei

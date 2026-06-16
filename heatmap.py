@@ -233,6 +233,17 @@ def mask_to_germany(grid: np.ndarray, lons, lats, boundary) -> np.ndarray:
     return masked
 
 
+def occupied_range(surface: np.ndarray) -> tuple[float, float]:
+    """Min/Max ueber belegte Zellen (Wert > 0); (0, 0) wenn nichts belegt ist.
+
+    So wird die Farbskala auf den tatsaechlichen Wertebereich gestreckt (nicht 0..Max).
+    """
+    covered = surface[np.isfinite(surface) & (surface > 0)]
+    if covered.size:
+        return float(covered.min()), float(covered.max())
+    return 0.0, 0.0
+
+
 # --------------------------------------------------------------------------- #
 # 3) Rendering
 # --------------------------------------------------------------------------- #
@@ -267,13 +278,15 @@ def surface_to_rgba(surface: np.ndarray, vmin: float, vmax: float) -> np.ndarray
     return np.flipud(rgba)
 
 
-def build_hover_layer(value_grid, count_grid, lons, lats, boundary):
+def build_hover_layer(value_grid, count_grid, lons, lats, boundary,
+                      name="Werte (Mouseover)", show=True):
     """Transparentes, hover-bares Gitter, deckungsgleich mit dem Bildraster.
 
     Zeigt pro Rasterzelle einen Tooltip 'Wertigkeit (Personen)', z.B.
     ``12.0 (8)``. Es wird genau eine Zelle pro Bildraster-Zelle erzeugt (gleiche
     Aufloesung wie ``resolution_km``), damit Tooltips und Heatmap exakt
-    uebereinstimmen.
+    uebereinstimmen. ``name``/``show`` steuern Beschriftung und Default-
+    Sichtbarkeit in der LayerControl.
     """
     dlon = lons[1] - lons[0]
     dlat = lats[1] - lats[0]
@@ -309,7 +322,8 @@ def build_hover_layer(value_grid, count_grid, lons, lats, boundary):
 
     layer = folium.GeoJson(
         {"type": "FeatureCollection", "features": features},
-        name="Werte (Mouseover)",
+        name=name,
+        show=show,
         style_function=lambda _f: {
             "fillColor": "#000000", "color": "#000000",
             "weight": 0, "fillOpacity": 0,
@@ -338,7 +352,7 @@ def add_param_box(fmap, params: dict) -> None:
         ("Aufloesung", f"{params.get('resolution_km', 0):g} km (Bild + Tooltips)"),
         ("Werte", f"leer {params.get('value_empty', 0):g} / voll {params.get('value_filled', 0):g}"),
         ("Deckkraft", f"{params.get('opacity', 0):g}"),
-        ("Punkte", f"{params.get('n_points', 0)}"),
+        ("Datensaetze", f"{params.get('n_points', 0)} von {params.get('n_total', 0)}"),
         ("Bereich", f"{params.get('vmin', 0):.1f} .. {params.get('vmax', 0):.1f}"),
         ("Erstellt", str(params.get("created", ""))),
         ("Quelle", str(params.get("source", ""))),
@@ -363,49 +377,64 @@ def add_param_box(fmap, params: dict) -> None:
     fmap.get_root().html.add_child(folium.Element(box_html))
 
 
+def _make_colormap(vmin: float, vmax: float, caption: str):
+    """Erzeugt eine branca-Farbskala mit dem Standard-Farbverlauf.
+
+    branca erwartet Hex-Strings bzw. 0..1-Floats; 0..255-Integer-Tupel erzeugen
+    fehlerhafte Hex-Farben (grauer Balken). Daher Hex-Konvertierung.
+    """
+    return cm.LinearColormap(
+        colors=["#%02x%02x%02x" % stop[1] for stop in _COLOR_STOPS],
+        index=[vmin + stop[0] * (vmax - vmin) for stop in _COLOR_STOPS]
+        if vmax > vmin else None,
+        vmin=vmin,
+        vmax=vmax,
+        caption=caption,
+    )
+
+
 def render_map(
-    surface: np.ndarray,
-    count_grid: np.ndarray,
+    layers: list[dict],
     lons,
     lats,
-    vmin: float,
-    vmax: float,
     boundary,
     opacity: float,
     params: dict,
     output: Path,
 ) -> None:
+    """Rendert eine oder mehrere Heatmap-Ebenen in eine interaktive Karte.
+
+    Jeder Eintrag in ``layers`` ist ein Dict mit den Schluesseln ``surface``,
+    ``count_grid``, ``vmin``, ``vmax``, ``name`` (ImageOverlay), ``hover_name``
+    (Tooltip-Ebene), ``caption`` (Farbskala) und ``show`` (Default-Sichtbarkeit).
+    """
     lon_min, lon_max = float(lons[0]), float(lons[-1])
     lat_min, lat_max = float(lats[0]), float(lats[-1])
     center = [(lat_min + lat_max) / 2, (lon_min + lon_max) / 2]
 
     fmap = folium.Map(location=center, zoom_start=6, tiles="OpenStreetMap")
 
-    rgba = surface_to_rgba(surface, vmin, vmax)
-    folium.raster_layers.ImageOverlay(
-        image=rgba,
-        bounds=[[lat_min, lon_min], [lat_max, lon_max]],
-        opacity=opacity,
-        mercator_project=True,
-        name="Reise-Heatmap",
-    ).add_to(fmap)
+    for spec in layers:
+        rgba = surface_to_rgba(spec["surface"], spec["vmin"], spec["vmax"])
+        folium.raster_layers.ImageOverlay(
+            image=rgba,
+            bounds=[[lat_min, lon_min], [lat_max, lon_max]],
+            opacity=opacity,
+            mercator_project=True,
+            name=spec["name"],
+            show=spec["show"],
+        ).add_to(fmap)
 
-    hover_layer, n_cells = build_hover_layer(
-        surface, count_grid, lons, lats, boundary
-    )
-    hover_layer.add_to(fmap)
+        hover_layer, n_cells = build_hover_layer(
+            spec["surface"], spec["count_grid"], lons, lats, boundary,
+            name=spec["hover_name"], show=spec["show"],
+        )
+        hover_layer.add_to(fmap)
 
-    colormap = cm.LinearColormap(
-        # branca erwartet Hex-Strings bzw. 0..1-Floats; 0..255-Integer-Tupel
-        # erzeugen fehlerhafte Hex-Farben (grauer Balken). Daher Hex-Konvertierung.
-        colors=["#%02x%02x%02x" % stop[1] for stop in _COLOR_STOPS],
-        index=[vmin + stop[0] * (vmax - vmin) for stop in _COLOR_STOPS]
-        if vmax > vmin else None,
-        vmin=vmin,
-        vmax=vmax,
-        caption="Summierte Reisebereitschaft (Min..Max der belegten Flaeche)",
-    )
-    colormap.add_to(fmap)
+        _make_colormap(spec["vmin"], spec["vmax"], spec["caption"]).add_to(fmap)
+
+        print(f"Layer '{spec['name']}': Wertebereich {spec['vmin']:.1f} .. "
+              f"{spec['vmax']:.1f}, Hover-Gitter {n_cells} Zellen.")
 
     folium.LayerControl().add_to(fmap)
 
@@ -414,8 +443,6 @@ def render_map(
     output.parent.mkdir(parents=True, exist_ok=True)
     fmap.save(str(output))
     print(f"\nKarte gespeichert: {output}")
-    print(f"Wertebereich der Farbskala: {vmin:.1f} .. {vmax:.1f}")
-    print(f"Hover-Gitter: {n_cells} Zellen (deckungsgleich mit dem Bildraster).")
 
 
 # --------------------------------------------------------------------------- #
@@ -526,8 +553,18 @@ def main(argv=None) -> None:
     lons, lats = build_grid(boundary.bounds, args.resolution_km)
     print(f"Raster: {len(lats)} x {len(lons)} Zellen "
           f"(Aufloesung {args.resolution_km} km), {args.falloff}-Kanten.")
+    # Gewichtete Flaeche (value_empty/value_filled aus Config/CLI).
     grid, count_grid = accumulate(points, lons, lats, args.falloff, args.edge_frac)
     surface = mask_to_germany(grid, lons, lats, boundary)
+    vmin, vmax = occupied_range(surface)
+
+    # Ungewichtete Flaeche: dieselben Parameter, aber jeder Punkt zaehlt 1
+    # (leer = voll = 1). Die Mitgliedschaft (count_grid) ist identisch.
+    points_uw = points.copy()
+    points_uw["value"] = 1.0
+    grid_uw, _ = accumulate(points_uw, lons, lats, args.falloff, args.edge_frac)
+    surface_uw = mask_to_germany(grid_uw, lons, lats, boundary)
+    vmin_uw, vmax_uw = occupied_range(surface_uw)
 
     # Warnung, falls die Tooltip-Ebene (eine Zelle je belegter Rasterzelle) sehr
     # gross wird -> aufgeblaehte, traege HTML. Schwelle grob, als oberer Schaetzer.
@@ -535,14 +572,6 @@ def main(argv=None) -> None:
     if hover_cells > 50_000:
         print(f"  WARNUNG: ~{hover_cells} Tooltip-Zellen -> sehr grosse/traege HTML. "
               f"Erhoehe --resolution-km (aktuell {args.resolution_km} km).")
-
-    # Wertebereich nur ueber belegte Zellen (Wert > 0), damit die Farbskala
-    # auf Min..Max der ermittelten Werte gestreckt wird (nicht 0..Max).
-    covered = surface[np.isfinite(surface) & (surface > 0)]
-    if covered.size:
-        vmin, vmax = float(covered.min()), float(covered.max())
-    else:
-        vmin, vmax = 0.0, 0.0
 
     if "docs.google.com/spreadsheets" in args.input:
         source_label = "Google Sheet"
@@ -557,14 +586,33 @@ def main(argv=None) -> None:
         "value_filled": args.value_filled,
         "opacity": args.opacity,
         "n_points": len(points),
+        "n_total": len(df),
         "vmin": vmin,
         "vmax": vmax,
         # Feste Zeitzone Europe/Berlin, da der CI-Lauf sonst UTC anzeigen wuerde.
         "created": datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d %H:%M %Z"),
         "source": source_label,
     }
-    render_map(surface, count_grid, lons, lats, vmin, vmax, boundary,
-               args.opacity, params, Path(args.output))
+
+    layers = [
+        {
+            "surface": surface, "count_grid": count_grid,
+            "vmin": vmin, "vmax": vmax,
+            "name": "Reise-Heatmap (gewichtet)",
+            "hover_name": "Werte (Mouseover)",
+            "caption": "Reisebereitschaft gewichtet (Min..Max der belegten Flaeche)",
+            "show": True,
+        },
+        {
+            "surface": surface_uw, "count_grid": count_grid,
+            "vmin": vmin_uw, "vmax": vmax_uw,
+            "name": "Reise-Heatmap (ungewichtet)",
+            "hover_name": "Werte ungew. (Mouseover)",
+            "caption": "Reisebereitschaft ungewichtet, jeder = 1 (Min..Max)",
+            "show": False,
+        },
+    ]
+    render_map(layers, lons, lats, boundary, args.opacity, params, Path(args.output))
 
 
 if __name__ == "__main__":
