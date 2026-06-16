@@ -402,16 +402,24 @@ def build_heatmap_layer(value_grid, count_grid, lons, lats, boundary,
     return group, len(features), n_top
 
 
-def add_param_box(fmap, params: dict) -> None:
+def add_param_box(fmap, params: dict, box_id: str, visible: bool) -> None:
     """Haengt ein fest positioniertes Info-Panel mit den Erstellungs-Parametern an.
 
     Das Panel sitzt unten links und kollidiert damit weder mit der LayerControl
     (oben rechts) noch mit der Farbskala (unten rechts). Es zeigt, mit welchen
     Einstellungen die Karte erzeugt wurde. Die Datenquelle wird bewusst nur als
     Typ/Dateiname (ohne URL) ausgegeben.
+
+    Es wird ein Panel je Layer erzeugt (eindeutige ``box_id``); ``visible``
+    steuert die Anfangs-Sichtbarkeit. Alle Panels liegen am selben Ort uebereinander
+    und werden per :class:`BindParamBox` passend zum aktiven Layer ein-/ausgeblendet,
+    sodass die layerspezifischen Angaben (Ansicht, Bereich) immer zur Karte passen.
     """
     falloff = str(params.get("falloff", ""))
-    rows = [("Falloff", falloff)]
+    rows = []
+    if params.get("view"):
+        rows.append(("Ansicht", str(params["view"])))
+    rows.append(("Falloff", falloff))
     if falloff == "plateau":
         rows.append(("Kantenanteil", f"{params.get('edge_frac', 0):.2f}"))
     rows += [
@@ -430,8 +438,9 @@ def add_param_box(fmap, params: dict) -> None:
         for label, value in rows
     )
     box_html = f"""
-    <div style="
+    <div id="{box_id}" style="
         position: fixed; bottom: 18px; left: 12px; z-index: 9999;
+        display: {'block' if visible else 'none'};
         background: rgba(255,255,255,0.92); border: 1px solid #999;
         border-radius: 6px; padding: 8px 10px; font-size: 12px;
         font-family: Arial, sans-serif; color: #222; line-height: 1.35;
@@ -489,6 +498,39 @@ class BindColormap(MacroElement):
         """)
 
 
+class BindParamBox(MacroElement):
+    """Koppelt die Sichtbarkeit eines Parameter-Panels (per DOM-id) an einen Layer.
+
+    Analog zu :class:`BindColormap`, aber fuer das fest positionierte Info-Panel:
+    beim Ein-/Ausblenden des Layers wird das passende Panel (``box_id``) gezeigt
+    bzw. versteckt, sodass die layerspezifischen Angaben immer zur Karte passen.
+    """
+
+    def __init__(self, layer, box_id: str, visible: bool):
+        super().__init__()
+        self.layer = layer
+        self.box_id = box_id
+        self.visible = visible
+        self._template = Template("""
+        {% macro script(this, kwargs) %}
+            (function() {
+                var box = document.getElementById('{{this.box_id}}');
+                if (box) box.style.display = '{{ "block" if this.visible else "none" }}';
+                {{this._parent.get_name()}}.on('overlayadd', function (e) {
+                    if (e.layer == {{this.layer.get_name()}}) {
+                        var b = document.getElementById('{{this.box_id}}');
+                        if (b) b.style.display = 'block';
+                    }});
+                {{this._parent.get_name()}}.on('overlayremove', function (e) {
+                    if (e.layer == {{this.layer.get_name()}}) {
+                        var b = document.getElementById('{{this.box_id}}');
+                        if (b) b.style.display = 'none';
+                    }});
+            })();
+        {% endmacro %}
+        """)
+
+
 def render_map(
     layers: list[dict],
     lons,
@@ -519,7 +561,7 @@ def render_map(
     ))
 
     bindings = []
-    for spec in layers:
+    for i, spec in enumerate(layers):
         colormap = _make_colormap(spec["vmin"], spec["vmax"], spec["caption"])
         layer, n_cells, n_top = build_heatmap_layer(
             spec["surface"], spec["count_grid"], lons, lats, boundary,
@@ -527,19 +569,26 @@ def render_map(
         )
         layer.add_to(fmap)
         colormap.add_to(fmap)
-        bindings.append((layer, colormap, spec["show"]))
+
+        # Parameter-Panel je Layer: gemeinsame Parameter, aber layerspezifische
+        # Ansicht und Bereich (Min..Max der jeweiligen Flaeche).
+        box_id = f"param-box-{i}"
+        box_params = {**params, "view": spec["name"],
+                      "vmin": spec["vmin"], "vmax": spec["vmax"]}
+        add_param_box(fmap, box_params, box_id, spec["show"])
+
+        bindings.append((layer, colormap, box_id, spec["show"]))
 
         print(f"Layer '{spec['name']}': Wertebereich {spec['vmin']:.1f} .. "
               f"{spec['vmax']:.1f}, {n_cells} Zellen, {n_top} Top-Wert-Zelle(n).")
 
     folium.LayerControl().add_to(fmap)
 
-    # Jede Legende an ihren Layer koppeln -> es ist immer nur die Legende der
-    # aktuell sichtbaren Ebene(n) zu sehen.
-    for layer, colormap, show in bindings:
+    # Legende UND Parameter-Panel je Layer koppeln -> es ist immer nur die
+    # Legende/Box der aktuell sichtbaren Ebene(n) zu sehen.
+    for layer, colormap, box_id, show in bindings:
         fmap.add_child(BindColormap(layer, colormap, show))
-
-    add_param_box(fmap, params)
+        fmap.add_child(BindParamBox(layer, box_id, show))
 
     output.parent.mkdir(parents=True, exist_ok=True)
     fmap.save(str(output))
