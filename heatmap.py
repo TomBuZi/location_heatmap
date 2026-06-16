@@ -50,6 +50,9 @@ _COLOR_STOPS = [
 # Deckkraft der Heatmap-Ebene (Karte darunter bleibt sichtbar).
 DEFAULT_OPACITY = 0.3
 
+# Rahmenfarbe der Top-Wert-Zellen: noch dunkler als die Max-Farbe (#680000).
+TOP_OUTLINE_COLOR = "#330000"
+
 
 # --------------------------------------------------------------------------- #
 # 1) Eingabe einlesen
@@ -244,9 +247,67 @@ def occupied_range(surface: np.ndarray) -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def find_top_cells(surface: np.ndarray, count_grid: np.ndarray) -> np.ndarray:
+    """Boolean-Maske der 'Top-Wert'-Zellen.
+
+    Top-Wert = hoechster (endlicher) gewichteter Wert. Gibt es mehrere Zellen
+    mit exakt diesem Wert, zaehlt unter ihnen die hoechste Anzahl an
+    Datenbankeintraegen (``count_grid``). Alle so bestimmten Zellen werden
+    markiert (es koennen mehrere sein - sie werden spaeter zu einer Flaeche
+    verschmolzen, falls sie aneinanderstossen).
+    """
+    finite = np.isfinite(surface) & (surface > 0)
+    if not finite.any():
+        return np.zeros(surface.shape, dtype=bool)
+    vmax = float(surface[finite].max())
+    at_max = finite & np.isclose(surface, vmax, rtol=1e-6, atol=1e-6)
+    cmax = int(count_grid[at_max].max())
+    return at_max & (count_grid == cmax)
+
+
 # --------------------------------------------------------------------------- #
 # 3) Rendering
 # --------------------------------------------------------------------------- #
+def build_top_outline(top_mask: np.ndarray, lons, lats):
+    """Verschmilzt die Top-Wert-Zellen zu einer Flaeche und liefert deren Rand.
+
+    Jede markierte Zelle wird als Lat/Lon-Rechteck erzeugt; alle Rechtecke
+    werden per ``shapely.union_all`` vereinigt. Aneinanderstossende Zellen
+    verschmelzen so zu einer Flaeche (gemeinsame Innenkanten verschwinden),
+    sodass nur der aeussere Rand als dunkelrote Umrandung gezeichnet wird.
+    Liefert ``(GeoJson | None, Anzahl Top-Zellen)``.
+    """
+    dlon = lons[1] - lons[0]
+    dlat = lats[1] - lats[0]
+    half_w, half_h = dlon / 2, dlat / 2
+
+    rows, cols = np.where(top_mask)
+    if rows.size == 0:
+        return None, 0
+
+    boxes = [
+        shapely.box(
+            float(lons[c]) - half_w, float(lats[r]) - half_h,
+            float(lons[c]) + half_w, float(lats[r]) + half_h,
+        )
+        for r, c in zip(rows, cols)
+    ]
+    merged = shapely.union_all(boxes)
+
+    outline = folium.GeoJson(
+        merged.__geo_interface__,
+        style_function=lambda _f: {
+            "fill": False,
+            "fillOpacity": 0.0,
+            "color": TOP_OUTLINE_COLOR,
+            "weight": 3,
+            "opacity": 1.0,
+        },
+        tooltip=folium.Tooltip("Top-Wert"),
+    )
+    return outline, int(rows.size)
+
+
 def build_heatmap_layer(value_grid, count_grid, lons, lats, boundary,
                         colormap, opacity, name, show):
     """Baut die Heatmap als farbige Polygone (eine je belegter Rasterzelle).
@@ -256,6 +317,11 @@ def build_heatmap_layer(value_grid, count_grid, lons, lats, boundary,
     traegt Farbe, Tooltip und Hover-Rahmen - dadurch sitzen sie zwangslaeufig
     deckungsgleich (kein Raster/Projektions-Versatz wie bei einem ImageOverlay).
     Leaflet projiziert die Polygon-Ecken korrekt nach Web-Mercator.
+
+    Die Top-Wert-Zellen (siehe ``find_top_cells``) bekommen zusaetzlich eine
+    verschmolzene dunkelrote Umrandung. Zellen und Umrandung liegen in einer
+    gemeinsamen ``FeatureGroup`` und lassen sich daher gemeinsam ein-/ausblenden.
+    Liefert ``(FeatureGroup, Anzahl Zellen, Anzahl Top-Zellen)``.
     """
     dlon = lons[1] - lons[0]
     dlat = lats[1] - lats[0]
@@ -293,10 +359,10 @@ def build_heatmap_layer(value_grid, count_grid, lons, lats, boundary,
                 },
             })
 
-    layer = folium.GeoJson(
+    group = folium.FeatureGroup(name=name, show=show)
+
+    cells = folium.GeoJson(
         {"type": "FeatureCollection", "features": features},
-        name=name,
-        show=show,
         style_function=lambda f: {
             "fillColor": f["properties"]["fill"],
             "color": f["properties"]["fill"],
@@ -309,7 +375,15 @@ def build_heatmap_layer(value_grid, count_grid, lons, lats, boundary,
         },
         tooltip=folium.GeoJsonTooltip(fields=["info"], labels=False, sticky=True),
     )
-    return layer, len(features)
+    cells.add_to(group)
+
+    # Top-Wert-Zellen: nur innerhalb der Maske (Deutschland) gewertet.
+    top_mask = find_top_cells(value_grid, count_grid)
+    outline, n_top = build_top_outline(top_mask, lons, lats)
+    if outline is not None:
+        outline.add_to(group)
+
+    return group, len(features), n_top
 
 
 def add_param_box(fmap, params: dict) -> None:
@@ -400,7 +474,7 @@ def render_map(
 
     for spec in layers:
         colormap = _make_colormap(spec["vmin"], spec["vmax"], spec["caption"])
-        layer, n_cells = build_heatmap_layer(
+        layer, n_cells, n_top = build_heatmap_layer(
             spec["surface"], spec["count_grid"], lons, lats, boundary,
             colormap, opacity, spec["name"], spec["show"],
         )
@@ -408,7 +482,7 @@ def render_map(
         colormap.add_to(fmap)
 
         print(f"Layer '{spec['name']}': Wertebereich {spec['vmin']:.1f} .. "
-              f"{spec['vmax']:.1f}, {n_cells} Zellen.")
+              f"{spec['vmax']:.1f}, {n_cells} Zellen, {n_top} Top-Wert-Zelle(n).")
 
     folium.LayerControl().add_to(fmap)
 
