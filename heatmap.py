@@ -396,7 +396,9 @@ def render_map(
     hover_layer.add_to(fmap)
 
     colormap = cm.LinearColormap(
-        colors=[stop[1] for stop in _COLOR_STOPS],
+        # branca erwartet Hex-Strings bzw. 0..1-Floats; 0..255-Integer-Tupel
+        # erzeugen fehlerhafte Hex-Farben (grauer Balken). Daher Hex-Konvertierung.
+        colors=["#%02x%02x%02x" % stop[1] for stop in _COLOR_STOPS],
         index=[vmin + stop[0] * (vmax - vmin) for stop in _COLOR_STOPS]
         if vmax > vmin else None,
         vmin=vmin,
