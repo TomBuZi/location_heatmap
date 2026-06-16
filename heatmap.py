@@ -113,6 +113,18 @@ def extract_plz(value: str) -> str | None:
     return match.group(0).zfill(5)[:5]
 
 
+def count_meetings(value: str) -> int:
+    """Zaehlt die besuchten 'Treffen der Helden' in einem Zellwert.
+
+    Das Google-Formular erlaubt Mehrfachauswahl; der Sheets-Export verkettet die
+    angekreuzten Treffen (jeweils 'Treffen der Helden <Jahr> (<Ort>)'). Gezaehlt
+    wird, wie oft 'Treffen der Helden' im Zellwert vorkommt - leere Zelle = 0.
+    """
+    if value is None:
+        return 0
+    return len(re.findall(r"treffen der helden", str(value), flags=re.IGNORECASE))
+
+
 def prepare_points(
     df: pd.DataFrame,
     plz_col: str,
@@ -129,8 +141,10 @@ def prepare_points(
     if weight_col is not None:
         weight_series = df[weight_col].fillna("").astype(str).str.strip()
         filled = weight_series != ""
+        out["n_meetings"] = df[weight_col].map(count_meetings)
     else:
         filled = pd.Series(False, index=df.index)
+        out["n_meetings"] = 0
     out["value"] = np.where(filled, value_filled, value_empty)
 
     before = len(out)
@@ -500,7 +514,7 @@ def render_map(
 # argparse-``dest``-Namen, damit ``parser.set_defaults(**config)`` direkt greift.
 CONFIG_KEYS = {
     "falloff", "edge_frac", "resolution_km", "opacity",
-    "value_empty", "value_filled",
+    "value_empty", "value_filled", "value_special_max",
 }
 
 
@@ -541,6 +555,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Kreiswert, wenn die Gewichtungs-Spalte leer ist (Default 1).")
     p.add_argument("--value-filled", type=float, default=2.0,
                    help="Kreiswert, wenn die Gewichtungs-Spalte befuellt ist (Default 2).")
+    p.add_argument("--value-special-max", type=float, default=4.0,
+                   help="Obergrenze der Sonder-Gewichtung (Treffen-Layer): Grundwert 1 "
+                        "+ 1 je besuchtem Treffen, gedeckelt auf diesen Wert (Default 4).")
     p.add_argument("--falloff", choices=["hard", "soft", "plateau"], default="hard",
                    help="Kreisform: 'hard' (harte Kante), 'soft' (Gauss-Abfall) "
                         "oder 'plateau' (voller Wert bis Knick, dann Abfall auf 0).")
@@ -614,6 +631,16 @@ def main(argv=None) -> None:
     surface_uw = mask_to_germany(grid_uw, lons, lats, boundary)
     vmin_uw, vmax_uw = occupied_range(surface_uw)
 
+    # Sonder-Gewichtung (Experiment): Grundwert 1 je Datensatz, +1 je besuchtem
+    # Treffen der Helden, gedeckelt auf args.value_special_max (Default 4).
+    points_sp = points.copy()
+    points_sp["value"] = np.clip(
+        1 + points["n_meetings"].to_numpy(), 1, args.value_special_max
+    ).astype(float)
+    grid_sp, _ = accumulate(points_sp, lons, lats, args.falloff, args.edge_frac)
+    surface_sp = mask_to_germany(grid_sp, lons, lats, boundary)
+    vmin_sp, vmax_sp = occupied_range(surface_sp)
+
     # Warnung, falls die Tooltip-Ebene (eine Zelle je belegter Rasterzelle) sehr
     # gross wird -> aufgeblaehte, traege HTML. Schwelle grob, als oberer Schaetzer.
     hover_cells = int((count_grid > 0).sum())
@@ -655,6 +682,13 @@ def main(argv=None) -> None:
             "vmin": vmin_uw, "vmax": vmax_uw,
             "name": "Reise-Heatmap (ungewichtet)",
             "caption": "Reisebereitschaft ungewichtet, jeder = 1 (Min..Max)",
+            "show": False,
+        },
+        {
+            "surface": surface_sp, "count_grid": count_grid,
+            "vmin": vmin_sp, "vmax": vmax_sp,
+            "name": "Reise-Heatmap (Treffen-Gewichtung)",
+            "caption": f"Grundwert 1 + 1 je besuchtem Treffen (max {args.value_special_max:g})",
             "show": False,
         },
     ]
