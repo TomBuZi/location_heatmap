@@ -36,16 +36,6 @@ import data_sources
 # Mittlere Erdgroessen fuer die metrische Umrechnung von Grad <-> km.
 KM_PER_DEG_LAT = 111.32
 
-
-def _mercator_y(lat_deg):
-    """Web-Mercator-Y (in Grad) fuer eine geographische Breite."""
-    return np.degrees(np.arcsinh(np.tan(np.radians(lat_deg))))
-
-
-def _inv_mercator_y(y_deg):
-    """Umkehrung von _mercator_y: Mercator-Y (Grad) -> geographische Breite."""
-    return np.degrees(np.arctan(np.sinh(np.radians(y_deg))))
-
 # Kontrastreicher Farbverlauf der Heatmap: Fraktion (0..1) -> RGB.
 # Dunkelblau -> Hellblau -> Gelb -> Orange -> Rot -> Dunkelrot.
 _COLOR_STOPS = [
@@ -257,58 +247,24 @@ def occupied_range(surface: np.ndarray) -> tuple[float, float]:
 # --------------------------------------------------------------------------- #
 # 3) Rendering
 # --------------------------------------------------------------------------- #
-def surface_to_rgba(surface: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
-    """Wandelt die Summen-Oberflaeche in ein RGBA-Bild (uint8, Norden oben).
+def build_heatmap_layer(value_grid, count_grid, lons, lats, boundary,
+                        colormap, opacity, name, show):
+    """Baut die Heatmap als farbige Polygone (eine je belegter Rasterzelle).
 
-    Die Farbskala wird auf den tatsaechlichen Wertebereich [vmin, vmax] der
-    belegten Zellen gestreckt (nicht auf 0..max).
-    """
-    fracs = np.asarray([s[0] for s in _COLOR_STOPS])
-    reds = np.asarray([s[1][0] for s in _COLOR_STOPS], dtype=float)
-    greens = np.asarray([s[1][1] for s in _COLOR_STOPS], dtype=float)
-    blues = np.asarray([s[1][2] for s in _COLOR_STOPS], dtype=float)
-
-    valid = np.isfinite(surface) & (surface > 0)
-    norm = np.zeros_like(surface, dtype=float)
-    span = vmax - vmin
-    if span > 0:
-        norm[valid] = np.clip((surface[valid] - vmin) / span, 0.0, 1.0)
-    else:  # alle belegten Zellen haben denselben Wert
-        norm[valid] = 1.0
-
-    rgba = np.zeros(surface.shape + (4,), dtype=np.uint8)
-    rgba[..., 0] = np.interp(norm, fracs, reds)
-    rgba[..., 1] = np.interp(norm, fracs, greens)
-    rgba[..., 2] = np.interp(norm, fracs, blues)
-    # Alpha: nur Nullzellen transparent; die Gesamt-Deckkraft (z.B. 30%) regelt
-    # die ImageOverlay-opacity, damit die Karte darunter sichtbar bleibt.
-    rgba[..., 3] = np.where(valid, 255, 0).astype(np.uint8)
-
-    # folium erwartet Norden in Zeile 0 -> vertikal spiegeln (lats sind aufsteigend).
-    return np.flipud(rgba)
-
-
-def build_hover_layer(value_grid, count_grid, lons, lats, lat_edges, boundary,
-                      name="Werte (Mouseover)", show=True):
-    """Transparentes, hover-bares Gitter, deckungsgleich mit dem Bildraster.
-
-    Zeigt pro Rasterzelle einen Tooltip 'Wertigkeit (Personen)', z.B.
-    ``12.0 (8)``. Genau eine Zelle pro Bildraster-Zelle (gleiche Aufloesung wie
-    ``resolution_km``).
-
-    Wichtig: Die Latitude-Kanten der Zellen kommen aus ``lat_edges`` (Laenge
-    ``len(lats)+1``) und folgen den **Mercator-Baendern** des Bild-Overlays
-    (``mercator_project``). Nur so liegen die Hover-Rahmen deckungsgleich auf den
-    Farbzellen - gleichmaessige Grad-Rechtecke wuerden zu den Polen hin
-    auseinanderlaufen. Die Laenge (x) ist linear, daher gleichmaessige Zellen.
+    Jede Zelle ist ein Lat/Lon-Rechteck, eingefaerbt nach ihrem Wert und mit
+    einem Tooltip 'Wertigkeit (Personen)', z.B. ``12.0 (8)``. Dieselbe Geometrie
+    traegt Farbe, Tooltip und Hover-Rahmen - dadurch sitzen sie zwangslaeufig
+    deckungsgleich (kein Raster/Projektions-Versatz wie bei einem ImageOverlay).
+    Leaflet projiziert die Polygon-Ecken korrekt nach Web-Mercator.
     """
     dlon = lons[1] - lons[0]
-    half_w = dlon / 2
+    dlat = lats[1] - lats[0]
+    half_w, half_h = dlon / 2, dlat / 2
 
     features = []
     for ilat in range(len(lats)):
         clat = float(lats[ilat])
-        south, north = float(lat_edges[ilat]), float(lat_edges[ilat + 1])
+        south, north = clat - half_h, clat + half_h
         for ilon in range(len(lons)):
             count = int(count_grid[ilat, ilon])
             if count <= 0:
@@ -321,7 +277,10 @@ def build_hover_layer(value_grid, count_grid, lons, lats, lat_edges, boundary,
                 value = 0.0
             features.append({
                 "type": "Feature",
-                "properties": {"info": f"{value:.1f} ({count})"},
+                "properties": {
+                    "info": f"{value:.1f} ({count})",
+                    "fill": colormap(value),
+                },
                 "geometry": {
                     "type": "Polygon",
                     "coordinates": [[
@@ -338,12 +297,15 @@ def build_hover_layer(value_grid, count_grid, lons, lats, lat_edges, boundary,
         {"type": "FeatureCollection", "features": features},
         name=name,
         show=show,
-        style_function=lambda _f: {
-            "fillColor": "#000000", "color": "#000000",
-            "weight": 0, "fillOpacity": 0,
+        style_function=lambda f: {
+            "fillColor": f["properties"]["fill"],
+            "color": f["properties"]["fill"],
+            "weight": 0,
+            "fillOpacity": opacity,
         },
         highlight_function=lambda _f: {
-            "weight": 1.5, "color": "#222222", "fillOpacity": 0.2,
+            "weight": 1.2, "color": "#222222",
+            "fillOpacity": min(1.0, opacity + 0.25),
         },
         tooltip=folium.GeoJsonTooltip(fields=["info"], labels=False, sticky=True),
     )
@@ -363,7 +325,7 @@ def add_param_box(fmap, params: dict) -> None:
     if falloff == "plateau":
         rows.append(("Kantenanteil", f"{params.get('edge_frac', 0):.2f}"))
     rows += [
-        ("Aufloesung", f"{params.get('resolution_km', 0):g} km (Bild + Tooltips)"),
+        ("Aufloesung", f"{params.get('resolution_km', 0):g} km"),
         ("Werte", f"leer {params.get('value_empty', 0):g} / voll {params.get('value_filled', 0):g}"),
         ("Deckkraft", f"{params.get('opacity', 0):g}"),
         ("Datensaetze", f"{params.get('n_points', 0)} von {params.get('n_total', 0)}"),
@@ -419,40 +381,12 @@ def render_map(
     """Rendert eine oder mehrere Heatmap-Ebenen in eine interaktive Karte.
 
     Jeder Eintrag in ``layers`` ist ein Dict mit den Schluesseln ``surface``,
-    ``count_grid``, ``vmin``, ``vmax``, ``name`` (ImageOverlay), ``hover_name``
-    (Tooltip-Ebene), ``caption`` (Farbskala) und ``show`` (Default-Sichtbarkeit).
+    ``count_grid``, ``vmin``, ``vmax``, ``name`` (Ebene/Farbskala), ``caption``
+    (Farbskala) und ``show`` (Default-Sichtbarkeit).
     """
     lon_min, lon_max = float(lons[0]), float(lons[-1])
     lat_min, lat_max = float(lats[0]), float(lats[-1])
     center = [(lat_min + lat_max) / 2, (lon_min + lon_max) / 2]
-
-    # Bild-Bounds in BEIDEN Achsen um eine halbe Zelle erweitern, damit die
-    # Pixel-Mittelpunkte exakt auf den Rasterpunkten lons[i]/lats[j] liegen -
-    # deckungsgleich mit den dort zentrierten Hover-Polygonen.
-    #   * Laenge (x): Leaflet streckt das Bild linear -> ohne Erweiterung
-    #     halber-Pixel-Versatz.
-    #   * Breite (y): mercator_project interpretiert die Bounds als die AEUSSEREN
-    #     Kanten des Bildes (Zeilen-Zentren liegen eine halbe Zelle innerhalb).
-    #     Ohne Erweiterung landen die Zeilen daher um bis zu eine halbe Zelle
-    #     daneben -> nach Nord/Sued wachsender Versatz.
-    # Numerisch durch die folium-mercator_transform-Pipeline verifiziert: mit
-    # Erweiterung ist der Versatz ~0 km ueber ganz Deutschland.
-    dlon = float(lons[1] - lons[0])
-    dlat = float(lats[1] - lats[0])
-    lat_lo, lat_hi = lat_min - dlat / 2, lat_max + dlat / 2
-    img_bounds = [
-        [lat_lo, lon_min - dlon / 2],
-        [lat_max + dlat / 2, lon_max + dlon / 2],
-    ]
-
-    # Latitude-Kanten der Hover-Zellen entlang der Mercator-Baender des Bildes
-    # (mercator_project teilt [lat_lo, lat_hi] gleichmaessig in Mercator-Y).
-    # So sitzen die Hover-Rahmen deckungsgleich auf den Farbzellen.
-    n_lat = len(lats)
-    merc_edges = (_mercator_y(lat_lo)
-                  + np.arange(n_lat + 1) / n_lat
-                  * (_mercator_y(lat_hi) - _mercator_y(lat_lo)))
-    lat_edges = _inv_mercator_y(merc_edges)
 
     fmap = folium.Map(location=center, zoom_start=6, tiles="OpenStreetMap")
 
@@ -465,26 +399,16 @@ def render_map(
     ))
 
     for spec in layers:
-        rgba = surface_to_rgba(spec["surface"], spec["vmin"], spec["vmax"])
-        folium.raster_layers.ImageOverlay(
-            image=rgba,
-            bounds=img_bounds,
-            opacity=opacity,
-            mercator_project=True,
-            name=spec["name"],
-            show=spec["show"],
-        ).add_to(fmap)
-
-        hover_layer, n_cells = build_hover_layer(
-            spec["surface"], spec["count_grid"], lons, lats, lat_edges, boundary,
-            name=spec["hover_name"], show=spec["show"],
+        colormap = _make_colormap(spec["vmin"], spec["vmax"], spec["caption"])
+        layer, n_cells = build_heatmap_layer(
+            spec["surface"], spec["count_grid"], lons, lats, boundary,
+            colormap, opacity, spec["name"], spec["show"],
         )
-        hover_layer.add_to(fmap)
-
-        _make_colormap(spec["vmin"], spec["vmax"], spec["caption"]).add_to(fmap)
+        layer.add_to(fmap)
+        colormap.add_to(fmap)
 
         print(f"Layer '{spec['name']}': Wertebereich {spec['vmin']:.1f} .. "
-              f"{spec['vmax']:.1f}, Hover-Gitter {n_cells} Zellen.")
+              f"{spec['vmax']:.1f}, {n_cells} Zellen.")
 
     folium.LayerControl().add_to(fmap)
 
@@ -649,7 +573,6 @@ def main(argv=None) -> None:
             "surface": surface, "count_grid": count_grid,
             "vmin": vmin, "vmax": vmax,
             "name": "Reise-Heatmap (gewichtet)",
-            "hover_name": "Werte (Mouseover)",
             "caption": "Reisebereitschaft gewichtet (Min..Max der belegten Flaeche)",
             "show": True,
         },
@@ -657,7 +580,6 @@ def main(argv=None) -> None:
             "surface": surface_uw, "count_grid": count_grid,
             "vmin": vmin_uw, "vmax": vmax_uw,
             "name": "Reise-Heatmap (ungewichtet)",
-            "hover_name": "Werte ungew. (Mouseover)",
             "caption": "Reisebereitschaft ungewichtet, jeder = 1 (Min..Max)",
             "show": False,
         },
