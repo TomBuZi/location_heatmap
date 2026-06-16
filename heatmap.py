@@ -30,6 +30,8 @@ import folium
 import numpy as np
 import pandas as pd
 import shapely
+from branca.element import MacroElement
+from jinja2 import Template
 
 import data_sources
 
@@ -457,6 +459,36 @@ def _make_colormap(vmin: float, vmax: float, caption: str):
     )
 
 
+class BindColormap(MacroElement):
+    """Koppelt die Sichtbarkeit einer Farbskala an einen Layer.
+
+    Beim Ein-/Ausblenden des Layers (LayerControl) wird die zugehoerige
+    branca-Farbskala per Leaflet-Event mit ein- bzw. ausgeblendet, sodass immer
+    nur die Legende(n) der aktuell sichtbaren Ebene(n) erscheint. Die
+    Anfangs-Sichtbarkeit richtet sich nach ``visible`` (Default-Anzeige).
+    """
+
+    def __init__(self, layer, colormap, visible: bool):
+        super().__init__()
+        self.layer = layer
+        self.colormap = colormap
+        self.visible = visible
+        self._template = Template("""
+        {% macro script(this, kwargs) %}
+            {{this.colormap.get_name()}}.svg[0][0].style.display =
+                '{{ "block" if this.visible else "none" }}';
+            {{this._parent.get_name()}}.on('overlayadd', function (e) {
+                if (e.layer == {{this.layer.get_name()}}) {
+                    {{this.colormap.get_name()}}.svg[0][0].style.display = 'block';
+                }});
+            {{this._parent.get_name()}}.on('overlayremove', function (e) {
+                if (e.layer == {{this.layer.get_name()}}) {
+                    {{this.colormap.get_name()}}.svg[0][0].style.display = 'none';
+                }});
+        {% endmacro %}
+        """)
+
+
 def render_map(
     layers: list[dict],
     lons,
@@ -486,6 +518,7 @@ def render_map(
         '<meta http-equiv="Expires" content="0">'
     ))
 
+    bindings = []
     for spec in layers:
         colormap = _make_colormap(spec["vmin"], spec["vmax"], spec["caption"])
         layer, n_cells, n_top = build_heatmap_layer(
@@ -494,11 +527,17 @@ def render_map(
         )
         layer.add_to(fmap)
         colormap.add_to(fmap)
+        bindings.append((layer, colormap, spec["show"]))
 
         print(f"Layer '{spec['name']}': Wertebereich {spec['vmin']:.1f} .. "
               f"{spec['vmax']:.1f}, {n_cells} Zellen, {n_top} Top-Wert-Zelle(n).")
 
     folium.LayerControl().add_to(fmap)
+
+    # Jede Legende an ihren Layer koppeln -> es ist immer nur die Legende der
+    # aktuell sichtbaren Ebene(n) zu sehen.
+    for layer, colormap, show in bindings:
+        fmap.add_child(BindColormap(layer, colormap, show))
 
     add_param_box(fmap, params)
 
