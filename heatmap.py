@@ -412,14 +412,16 @@ def render_map(
     lat_min, lat_max = float(lats[0]), float(lats[-1])
     center = [(lat_min + lat_max) / 2, (lon_min + lon_max) / 2]
 
-    # Bild-Bounds um eine halbe Zelle erweitern, damit die Pixel-Mittelpunkte
-    # genau auf den Rasterpunkten lons[i]/lats[j] liegen - also deckungsgleich mit
-    # den dort zentrierten Hover-Polygonen (sonst halber-Pixel-Versatz).
+    # Bild-Bounds nur in der Laenge (x) um eine halbe Zelle erweitern, damit die
+    # Pixel-Mittelpunkte auf den Rasterpunkten lons[i] liegen (Leaflet streckt das
+    # Bild dort linear -> sonst halber-Pixel-Versatz zu den Hover-Polygonen).
+    # Die Breite (y) wird NICHT erweitert: dort uebernimmt mercator_project die
+    # Zeilen-Zuordnung anhand der Rasterpunkte lats[j]; eine Erweiterung wuerde
+    # einen nach Nord/Sued wachsenden Versatz erzeugen.
     dlon = float(lons[1] - lons[0])
-    dlat = float(lats[1] - lats[0])
     img_bounds = [
-        [lat_min - dlat / 2, lon_min - dlon / 2],
-        [lat_max + dlat / 2, lon_max + dlon / 2],
+        [lat_min, lon_min - dlon / 2],
+        [lat_max, lon_max + dlon / 2],
     ]
 
     fmap = folium.Map(location=center, zoom_start=6, tiles="OpenStreetMap")
