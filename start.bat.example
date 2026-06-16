@@ -1,0 +1,36 @@
+@echo off
+REM ============================================================
+REM  Vorlage fuer den lokalen Starter.
+REM  Kopiere diese Datei nach start.bat und trage deine echte
+REM  Google-Sheets-URL ein. start.bat selbst wird per .gitignore
+REM  vom Repository ausgeschlossen (enthaelt die private URL).
+REM
+REM  Stil-Parameter (falloff, Aufloesung, Deckkraft, Werte) werden
+REM  aus config.toml gelesen - hier nicht noetig.
+REM ============================================================
+setlocal
+cd /d "%~dp0"
+
+set "SHEET_URL=https://docs.google.com/spreadsheets/d/<DEINE-SHEET-ID>/edit"
+set "OUTPUT=output\heatmap.html"
+
+echo.
+echo === Heatmap wird aktualisiert (Live-Daten aus Google Sheet) ===
+echo.
+
+python heatmap.py --input "%SHEET_URL%" --output "%OUTPUT%"
+
+if errorlevel 1 (
+    echo.
+    echo FEHLER: Die Heatmap konnte nicht erzeugt werden.
+    echo Pruefe Internetverbindung und ob "pip install -r requirements.txt" ausgefuehrt wurde.
+    echo.
+    pause
+    exit /b 1
+)
+
+echo.
+echo === Karte wird im Browser geoeffnet ===
+start "" "%OUTPUT%"
+
+endlocal

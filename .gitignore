@@ -1,0 +1,14 @@
+# Erzeugte Ausgabe / CI-Build
+output/
+public/
+
+# Heruntergeladene Geodaten (werden zur Laufzeit gecacht)
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Lokaler Starter mit echter Google-Sheets-URL -> NICHT veroeffentlichen.
+# Vorlage ohne URL: start.bat.example
+start.bat

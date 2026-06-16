@@ -1,0 +1,567 @@
+"""Reise-Heatmap ueber Deutschland.
+
+Liest eine Tabelle (Google-Sheets-URL, CSV oder XLSX) mit den Spalten
+Postleitzahl, maximale Reiseweite (km) und einer Gewichtungs-Spalte. Um jede
+PLZ wird ein Kreis mit dem Radius der Reiseweite gelegt; der Kreis traegt den
+Wert ``value_empty`` (Gewichtung leer) bzw. ``value_filled`` (Gewichtung
+befuellt). Alle Kreise werden auf einem Raster ueber Deutschland aufaddiert,
+auf den Deutschland-Umriss zugeschnitten und als interaktive HTML-Karte
+(Leaflet/folium) ausgegeben.
+
+Beispiel:
+    python heatmap.py --input "https://docs.google.com/spreadsheets/d/<ID>/edit"
+    python heatmap.py --input daten.csv --falloff soft --resolution-km 2
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import math
+import re
+import sys
+import tomllib
+from datetime import datetime
+from pathlib import Path
+
+import branca.colormap as cm
+import folium
+import numpy as np
+import pandas as pd
+import shapely
+
+import data_sources
+
+# Mittlere Erdgroessen fuer die metrische Umrechnung von Grad <-> km.
+KM_PER_DEG_LAT = 111.32
+
+# Kontrastreicher Farbverlauf der Heatmap: Fraktion (0..1) -> RGB.
+# Dunkelblau -> Hellblau -> Gelb -> Orange -> Rot -> Dunkelrot.
+_COLOR_STOPS = [
+    (0.0, (10, 30, 110)),     # Dunkelblau (wenig)
+    (0.2, (90, 170, 230)),    # Hellblau
+    (0.4, (255, 230, 0)),     # Gelb
+    (0.6, (255, 140, 0)),     # Orange
+    (0.8, (220, 20, 20)),     # Rot
+    (1.0, (104, 0, 0)),       # Dunkelrot (#680000, viel)
+]
+
+# Deckkraft der Heatmap-Ebene (Karte darunter bleibt sichtbar).
+DEFAULT_OPACITY = 0.3
+
+
+# --------------------------------------------------------------------------- #
+# 1) Eingabe einlesen
+# --------------------------------------------------------------------------- #
+def sheets_url_to_csv(url: str, gid: str | None) -> str:
+    """Wandelt eine Google-Sheets-Bearbeitungs-URL in die CSV-Export-URL um."""
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+    if not match:
+        return url
+    sheet_id = match.group(1)
+    export = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+    if gid is None:
+        gid_match = re.search(r"[#&?]gid=([0-9]+)", url)
+        gid = gid_match.group(1) if gid_match else None
+    if gid is not None:
+        export += f"&gid={gid}"
+    return export
+
+
+def read_table(input_source: str, sep: str, gid: str | None) -> pd.DataFrame:
+    """Liest die Tabelle aus Google-Sheets-URL, CSV- oder XLSX-Datei."""
+    if "docs.google.com/spreadsheets" in input_source:
+        csv_url = sheets_url_to_csv(input_source, gid)
+        print(f"Lese Google Sheet (live): {csv_url}")
+        return pd.read_csv(csv_url, dtype=str)  # Sheets-Export ist Komma-getrennt
+
+    path = Path(input_source)
+    if not path.exists():
+        sys.exit(f"Eingabedatei nicht gefunden: {path}")
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        print(f"Lese Excel-Datei: {path}")
+        return pd.read_excel(path, dtype=str)
+    print(f"Lese CSV-Datei: {path}")
+    return pd.read_csv(path, sep=sep, dtype=str)
+
+
+def find_column(df: pd.DataFrame, keywords: list[str], explicit: str | None) -> str | None:
+    """Findet eine Spalte per exaktem Namen oder per Schluesselwort-Teiltreffer."""
+    if explicit:
+        if explicit in df.columns:
+            return explicit
+        sys.exit(f"Angegebene Spalte '{explicit}' nicht gefunden. "
+                 f"Vorhandene Spalten: {list(df.columns)}")
+    for kw in keywords:
+        for col in df.columns:
+            if kw.lower() in str(col).lower():
+                return col
+    return None
+
+
+def extract_plz(value: str) -> str | None:
+    """Holt die erste 5-stellige Zahl aus einem Zellwert (z.B. '81735')."""
+    if value is None:
+        return None
+    match = re.search(r"\d{4,5}", str(value))
+    if not match:
+        return None
+    return match.group(0).zfill(5)[:5]
+
+
+def prepare_points(
+    df: pd.DataFrame,
+    plz_col: str,
+    dist_col: str,
+    weight_col: str | None,
+    value_empty: float,
+    value_filled: float,
+) -> pd.DataFrame:
+    """Baut ein DataFrame mit Spalten plz, radius_km, value aus der Rohtabelle."""
+    out = pd.DataFrame()
+    out["plz"] = df[plz_col].map(extract_plz)
+    out["radius_km"] = pd.to_numeric(df[dist_col], errors="coerce")
+
+    if weight_col is not None:
+        weight_series = df[weight_col].fillna("").astype(str).str.strip()
+        filled = weight_series != ""
+    else:
+        filled = pd.Series(False, index=df.index)
+    out["value"] = np.where(filled, value_filled, value_empty)
+
+    before = len(out)
+    out = out.dropna(subset=["plz", "radius_km"])
+    out = out[out["radius_km"] > 0]
+    dropped = before - len(out)
+    if dropped:
+        print(f"  {dropped} Zeile(n) ohne gueltige PLZ/Reiseweite uebersprungen.")
+    return out.reset_index(drop=True)
+
+
+def join_coordinates(points: pd.DataFrame, plz_coords: pd.DataFrame) -> pd.DataFrame:
+    """Verknuepft PLZ mit Lat/Lon; meldet nicht gefundene Postleitzahlen."""
+    merged = points.merge(plz_coords, on="plz", how="left")
+    missing = merged["lat"].isna()
+    n_missing = int(missing.sum())
+    if n_missing:
+        beispiele = sorted(merged.loc[missing, "plz"].unique())[:10]
+        print(f"  {n_missing} Eintrag/Eintraege ohne Koordinaten (PLZ unbekannt). "
+              f"Beispiele: {beispiele}")
+    merged = merged.dropna(subset=["lat", "lon"]).reset_index(drop=True)
+    print(f"  {len(merged)} Punkt(e) mit Koordinaten verwendet.")
+    return merged
+
+
+# --------------------------------------------------------------------------- #
+# 2) Raster-Akkumulation
+# --------------------------------------------------------------------------- #
+def build_grid(bounds, resolution_km: float):
+    """Erzeugt 1D-Achsen (lons, lats) in Grad fuer die Bounding-Box (minx,miny,maxx,maxy)."""
+    lon_min, lat_min, lon_max, lat_max = bounds
+    mean_lat = (lat_min + lat_max) / 2.0
+    dlat = resolution_km / KM_PER_DEG_LAT
+    dlon = resolution_km / (KM_PER_DEG_LAT * math.cos(math.radians(mean_lat)))
+    lats = np.arange(lat_min, lat_max + dlat, dlat)
+    lons = np.arange(lon_min, lon_max + dlon, dlon)
+    return lons, lats
+
+
+def accumulate(points: pd.DataFrame, lons, lats, falloff: str, edge_frac: float = 0.8):
+    """Stempelt fuer jeden Punkt einen Kreis ins Raster.
+
+    Liefert zwei Raster:
+      * ``grid``  - summierte (gewichtete) Werte gemaess Kreisform (falloff).
+      * ``count`` - Anzahl der Personen, in deren Reise-Radius die Zelle liegt
+        (immer harte Mitgliedschaft dist <= radius, unabhaengig vom falloff).
+    """
+    grid = np.zeros((len(lats), len(lons)), dtype=np.float32)
+    count = np.zeros((len(lats), len(lons)), dtype=np.int32)
+    dlon = lons[1] - lons[0]
+    dlat = lats[1] - lats[0]
+
+    for plat, plon, radius, value in zip(
+        points["lat"].to_numpy(),
+        points["lon"].to_numpy(),
+        points["radius_km"].to_numpy(),
+        points["value"].to_numpy(),
+    ):
+        km_per_deg_lon = KM_PER_DEG_LAT * math.cos(math.radians(plat))
+        # Fenster (Index-Bereich) der Radius-Bounding-Box bestimmen.
+        rad_lat = radius / KM_PER_DEG_LAT
+        rad_lon = radius / km_per_deg_lon
+        col_lo = max(0, int(math.floor((plon - rad_lon - lons[0]) / dlon)))
+        col_hi = min(len(lons) - 1, int(math.ceil((plon + rad_lon - lons[0]) / dlon)))
+        row_lo = max(0, int(math.floor((plat - rad_lat - lats[0]) / dlat)))
+        row_hi = min(len(lats) - 1, int(math.ceil((plat + rad_lat - lats[0]) / dlat)))
+        if col_lo > col_hi or row_lo > row_hi:
+            continue
+
+        sub_lon = lons[col_lo:col_hi + 1]
+        sub_lat = lats[row_lo:row_hi + 1]
+        dx = (sub_lon[np.newaxis, :] - plon) * km_per_deg_lon
+        dy = (sub_lat[:, np.newaxis] - plat) * KM_PER_DEG_LAT
+        dist = np.sqrt(dx * dx + dy * dy)
+
+        inside = dist <= radius
+        if falloff == "soft":
+            sigma = radius / 2.0
+            contrib = value * np.exp(-(dist * dist) / (2.0 * sigma * sigma))
+        elif falloff == "plateau":
+            # Voller Wert bis zum Knick, dann glatter Cosinus-Abfall auf 0 an radius.
+            knee = edge_frac * radius
+            contrib = np.where(dist <= knee, float(value), 0.0)
+            shoulder = (dist > knee) & inside
+            if radius > knee:
+                t = (dist[shoulder] - knee) / (radius - knee)  # 0..1
+                contrib[shoulder] = value * 0.5 * (1.0 + np.cos(np.pi * t))
+        else:  # hard
+            contrib = np.where(inside, value, 0.0)
+
+        grid[row_lo:row_hi + 1, col_lo:col_hi + 1] += contrib.astype(np.float32)
+        count[row_lo:row_hi + 1, col_lo:col_hi + 1] += inside.astype(np.int32)
+
+    return grid, count
+
+
+def mask_to_germany(grid: np.ndarray, lons, lats, boundary) -> np.ndarray:
+    """Setzt alle Zellen ausserhalb des Deutschland-Umrisses auf NaN."""
+    lon_mesh, lat_mesh = np.meshgrid(lons, lats)
+    inside = shapely.contains_xy(boundary, lon_mesh, lat_mesh)
+    masked = grid.astype(np.float32).copy()
+    masked[~inside] = np.nan
+    return masked
+
+
+# --------------------------------------------------------------------------- #
+# 3) Rendering
+# --------------------------------------------------------------------------- #
+def surface_to_rgba(surface: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
+    """Wandelt die Summen-Oberflaeche in ein RGBA-Bild (uint8, Norden oben).
+
+    Die Farbskala wird auf den tatsaechlichen Wertebereich [vmin, vmax] der
+    belegten Zellen gestreckt (nicht auf 0..max).
+    """
+    fracs = np.asarray([s[0] for s in _COLOR_STOPS])
+    reds = np.asarray([s[1][0] for s in _COLOR_STOPS], dtype=float)
+    greens = np.asarray([s[1][1] for s in _COLOR_STOPS], dtype=float)
+    blues = np.asarray([s[1][2] for s in _COLOR_STOPS], dtype=float)
+
+    valid = np.isfinite(surface) & (surface > 0)
+    norm = np.zeros_like(surface, dtype=float)
+    span = vmax - vmin
+    if span > 0:
+        norm[valid] = np.clip((surface[valid] - vmin) / span, 0.0, 1.0)
+    else:  # alle belegten Zellen haben denselben Wert
+        norm[valid] = 1.0
+
+    rgba = np.zeros(surface.shape + (4,), dtype=np.uint8)
+    rgba[..., 0] = np.interp(norm, fracs, reds)
+    rgba[..., 1] = np.interp(norm, fracs, greens)
+    rgba[..., 2] = np.interp(norm, fracs, blues)
+    # Alpha: nur Nullzellen transparent; die Gesamt-Deckkraft (z.B. 30%) regelt
+    # die ImageOverlay-opacity, damit die Karte darunter sichtbar bleibt.
+    rgba[..., 3] = np.where(valid, 255, 0).astype(np.uint8)
+
+    # folium erwartet Norden in Zeile 0 -> vertikal spiegeln (lats sind aufsteigend).
+    return np.flipud(rgba)
+
+
+def build_hover_layer(value_grid, count_grid, lons, lats, boundary):
+    """Transparentes, hover-bares Gitter, deckungsgleich mit dem Bildraster.
+
+    Zeigt pro Rasterzelle einen Tooltip 'Wertigkeit (Personen)', z.B.
+    ``12.0 (8)``. Es wird genau eine Zelle pro Bildraster-Zelle erzeugt (gleiche
+    Aufloesung wie ``resolution_km``), damit Tooltips und Heatmap exakt
+    uebereinstimmen.
+    """
+    dlon = lons[1] - lons[0]
+    dlat = lats[1] - lats[0]
+    half_w, half_h = dlon / 2, dlat / 2
+
+    features = []
+    for ilat in range(len(lats)):
+        clat = float(lats[ilat])
+        for ilon in range(len(lons)):
+            count = int(count_grid[ilat, ilon])
+            if count <= 0:
+                continue
+            clon = float(lons[ilon])
+            if not shapely.contains_xy(boundary, clon, clat):
+                continue
+            value = float(value_grid[ilat, ilon])
+            if not math.isfinite(value):  # Randzelle ausserhalb der Maske
+                value = 0.0
+            features.append({
+                "type": "Feature",
+                "properties": {"info": f"{value:.1f} ({count})"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [clon - half_w, clat - half_h],
+                        [clon + half_w, clat - half_h],
+                        [clon + half_w, clat + half_h],
+                        [clon - half_w, clat + half_h],
+                        [clon - half_w, clat - half_h],
+                    ]],
+                },
+            })
+
+    layer = folium.GeoJson(
+        {"type": "FeatureCollection", "features": features},
+        name="Werte (Mouseover)",
+        style_function=lambda _f: {
+            "fillColor": "#000000", "color": "#000000",
+            "weight": 0, "fillOpacity": 0,
+        },
+        highlight_function=lambda _f: {
+            "weight": 1.5, "color": "#222222", "fillOpacity": 0.2,
+        },
+        tooltip=folium.GeoJsonTooltip(fields=["info"], labels=False, sticky=True),
+    )
+    return layer, len(features)
+
+
+def add_param_box(fmap, params: dict) -> None:
+    """Haengt ein fest positioniertes Info-Panel mit den Erstellungs-Parametern an.
+
+    Das Panel sitzt unten links und kollidiert damit weder mit der LayerControl
+    (oben rechts) noch mit der Farbskala (unten rechts). Es zeigt, mit welchen
+    Einstellungen die Karte erzeugt wurde. Die Datenquelle wird bewusst nur als
+    Typ/Dateiname (ohne URL) ausgegeben.
+    """
+    falloff = str(params.get("falloff", ""))
+    rows = [("Falloff", falloff)]
+    if falloff == "plateau":
+        rows.append(("Kantenanteil", f"{params.get('edge_frac', 0):.2f}"))
+    rows += [
+        ("Aufloesung", f"{params.get('resolution_km', 0):g} km (Bild + Tooltips)"),
+        ("Werte", f"leer {params.get('value_empty', 0):g} / voll {params.get('value_filled', 0):g}"),
+        ("Deckkraft", f"{params.get('opacity', 0):g}"),
+        ("Punkte", f"{params.get('n_points', 0)}"),
+        ("Bereich", f"{params.get('vmin', 0):.1f} .. {params.get('vmax', 0):.1f}"),
+        ("Erstellt", str(params.get("created", ""))),
+        ("Quelle", str(params.get("source", ""))),
+    ]
+
+    row_html = "".join(
+        f"<tr><td style='padding-right:8px;color:#555;white-space:nowrap'>{html.escape(label)}</td>"
+        f"<td style='font-weight:600'>{html.escape(value)}</td></tr>"
+        for label, value in rows
+    )
+    box_html = f"""
+    <div style="
+        position: fixed; bottom: 18px; left: 12px; z-index: 9999;
+        background: rgba(255,255,255,0.92); border: 1px solid #999;
+        border-radius: 6px; padding: 8px 10px; font-size: 12px;
+        font-family: Arial, sans-serif; color: #222; line-height: 1.35;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.3); max-width: 260px;">
+      <div style="font-weight:700; margin-bottom:4px;">Parameter</div>
+      <table style="border-collapse:collapse;">{row_html}</table>
+    </div>
+    """
+    fmap.get_root().html.add_child(folium.Element(box_html))
+
+
+def render_map(
+    surface: np.ndarray,
+    count_grid: np.ndarray,
+    lons,
+    lats,
+    vmin: float,
+    vmax: float,
+    boundary,
+    opacity: float,
+    params: dict,
+    output: Path,
+) -> None:
+    lon_min, lon_max = float(lons[0]), float(lons[-1])
+    lat_min, lat_max = float(lats[0]), float(lats[-1])
+    center = [(lat_min + lat_max) / 2, (lon_min + lon_max) / 2]
+
+    fmap = folium.Map(location=center, zoom_start=6, tiles="OpenStreetMap")
+
+    rgba = surface_to_rgba(surface, vmin, vmax)
+    folium.raster_layers.ImageOverlay(
+        image=rgba,
+        bounds=[[lat_min, lon_min], [lat_max, lon_max]],
+        opacity=opacity,
+        mercator_project=True,
+        name="Reise-Heatmap",
+    ).add_to(fmap)
+
+    hover_layer, n_cells = build_hover_layer(
+        surface, count_grid, lons, lats, boundary
+    )
+    hover_layer.add_to(fmap)
+
+    colormap = cm.LinearColormap(
+        colors=[stop[1] for stop in _COLOR_STOPS],
+        index=[vmin + stop[0] * (vmax - vmin) for stop in _COLOR_STOPS]
+        if vmax > vmin else None,
+        vmin=vmin,
+        vmax=vmax,
+        caption="Summierte Reisebereitschaft (Min..Max der belegten Flaeche)",
+    )
+    colormap.add_to(fmap)
+
+    folium.LayerControl().add_to(fmap)
+
+    add_param_box(fmap, params)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fmap.save(str(output))
+    print(f"\nKarte gespeichert: {output}")
+    print(f"Wertebereich der Farbskala: {vmin:.1f} .. {vmax:.1f}")
+    print(f"Hover-Gitter: {n_cells} Zellen (deckungsgleich mit dem Bildraster).")
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+# Config-Schluessel, die in config.toml gesetzt werden duerfen. Identisch mit den
+# argparse-``dest``-Namen, damit ``parser.set_defaults(**config)`` direkt greift.
+CONFIG_KEYS = {
+    "falloff", "edge_frac", "resolution_km", "opacity",
+    "value_empty", "value_filled",
+}
+
+
+def load_config(path: str) -> dict:
+    """Liest abweichende Stil-Parameter aus einer TOML-Datei.
+
+    Existiert die Datei nicht, wird ein leeres Dict geliefert (kein Fehler).
+    Unbekannte Schluessel werden mit einer Warnung ignoriert. Die Datenquelle
+    (``--input``) und der Ausgabepfad (``--output``) gehoeren bewusst NICHT in
+    die Config.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with p.open("rb") as fh:
+        data = tomllib.load(fh)
+    config = {}
+    for key, value in data.items():
+        if key in CONFIG_KEYS:
+            config[key] = value
+        else:
+            print(f"  Warnung: unbekannter Config-Schluessel '{key}' ignoriert.")
+    return config
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Reise-Heatmap ueber Deutschland erzeugen.")
+    p.add_argument("--config", default="config.toml",
+                   help="Pfad zur TOML-Config mit abweichenden Stil-Parametern "
+                        "(Default 'config.toml'; fehlt sie, gelten die Defaults).")
+    p.add_argument("--input", required=True,
+                   help="Google-Sheets-URL oder Pfad zu einer .csv/.xlsx-Datei.")
+    p.add_argument("--sep", default=";",
+                   help="CSV-Trennzeichen fuer lokale Dateien (Default ';').")
+    p.add_argument("--gid", default=None,
+                   help="Optionale Tabellenblatt-ID (gid) des Google Sheets.")
+    p.add_argument("--value-empty", type=float, default=1.0,
+                   help="Kreiswert, wenn die Gewichtungs-Spalte leer ist (Default 1).")
+    p.add_argument("--value-filled", type=float, default=2.0,
+                   help="Kreiswert, wenn die Gewichtungs-Spalte befuellt ist (Default 2).")
+    p.add_argument("--falloff", choices=["hard", "soft", "plateau"], default="hard",
+                   help="Kreisform: 'hard' (harte Kante), 'soft' (Gauss-Abfall) "
+                        "oder 'plateau' (voller Wert bis Knick, dann Abfall auf 0).")
+    p.add_argument("--edge-frac", type=float, default=0.8,
+                   help="Nur fuer --falloff plateau: Anteil des Radius mit vollem "
+                        "Wert vor dem Abfall (0..1, Default 0.8).")
+    p.add_argument("--resolution-km", type=float, default=5.0,
+                   help="Rasteraufloesung in km fuer Bild UND Tooltips (Default 5.0; "
+                        "kleinere Werte = feiner, aber deutlich groessere HTML).")
+    p.add_argument("--opacity", type=float, default=DEFAULT_OPACITY,
+                   help="Deckkraft der Heatmap-Ebene 0..1 (Default 0.3).")
+    p.add_argument("--output", default="output/heatmap.html",
+                   help="Pfad der HTML-Ausgabe.")
+    p.add_argument("--plz-col", default=None, help="Exakter Name der PLZ-Spalte.")
+    p.add_argument("--dist-col", default=None, help="Exakter Name der Reiseweite-Spalte.")
+    p.add_argument("--weight-col", default=None, help="Exakter Name der Gewichtungs-Spalte.")
+    return p
+
+
+def parse_args(argv=None):
+    parser = build_parser()
+    # Erste Phase: nur ``--config`` ermitteln, um die Datei zu finden.
+    pre, _ = parser.parse_known_args(argv)
+    config = load_config(pre.config)
+    if config:
+        print(f"Config geladen aus '{pre.config}': {config}")
+        # Praezedenz: Default < config.toml < explizites CLI-Argument.
+        parser.set_defaults(**config)
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+
+    df = read_table(args.input, args.sep, args.gid)
+    print(f"  {len(df)} Zeile(n), Spalten: {list(df.columns)}")
+
+    plz_col = find_column(df, ["postleitzahl", "plz"], args.plz_col)
+    dist_col = find_column(df, ["kilometer", "reiseweite", "weit"], args.dist_col)
+    weight_col = find_column(df, ["schon mal", "gewichtung", "treffen der helden"],
+                             args.weight_col)
+    if plz_col is None or dist_col is None:
+        sys.exit(f"PLZ- oder Reiseweite-Spalte nicht erkannt. "
+                 f"Spalten: {list(df.columns)}. Nutze --plz-col / --dist-col.")
+    print(f"  PLZ-Spalte: '{plz_col}' | Reiseweite-Spalte: '{dist_col}' | "
+          f"Gewichtungs-Spalte: '{weight_col}'")
+
+    points = prepare_points(df, plz_col, dist_col, weight_col,
+                            args.value_empty, args.value_filled)
+
+    plz_coords = data_sources.load_plz_coordinates()
+    points = join_coordinates(points, plz_coords)
+    if points.empty:
+        sys.exit("Keine verwertbaren Punkte vorhanden - Abbruch.")
+
+    boundary = data_sources.load_germany_boundary()
+
+    lons, lats = build_grid(boundary.bounds, args.resolution_km)
+    print(f"Raster: {len(lats)} x {len(lons)} Zellen "
+          f"(Aufloesung {args.resolution_km} km), {args.falloff}-Kanten.")
+    grid, count_grid = accumulate(points, lons, lats, args.falloff, args.edge_frac)
+    surface = mask_to_germany(grid, lons, lats, boundary)
+
+    # Warnung, falls die Tooltip-Ebene (eine Zelle je belegter Rasterzelle) sehr
+    # gross wird -> aufgeblaehte, traege HTML. Schwelle grob, als oberer Schaetzer.
+    hover_cells = int((count_grid > 0).sum())
+    if hover_cells > 50_000:
+        print(f"  WARNUNG: ~{hover_cells} Tooltip-Zellen -> sehr grosse/traege HTML. "
+              f"Erhoehe --resolution-km (aktuell {args.resolution_km} km).")
+
+    # Wertebereich nur ueber belegte Zellen (Wert > 0), damit die Farbskala
+    # auf Min..Max der ermittelten Werte gestreckt wird (nicht 0..Max).
+    covered = surface[np.isfinite(surface) & (surface > 0)]
+    if covered.size:
+        vmin, vmax = float(covered.min()), float(covered.max())
+    else:
+        vmin, vmax = 0.0, 0.0
+
+    if "docs.google.com/spreadsheets" in args.input:
+        source_label = "Google Sheet"
+    else:
+        source_label = Path(args.input).name
+
+    params = {
+        "falloff": args.falloff,
+        "edge_frac": args.edge_frac,
+        "resolution_km": args.resolution_km,
+        "value_empty": args.value_empty,
+        "value_filled": args.value_filled,
+        "opacity": args.opacity,
+        "n_points": len(points),
+        "vmin": vmin,
+        "vmax": vmax,
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "source": source_label,
+    }
+    render_map(surface, count_grid, lons, lats, vmin, vmax, boundary,
+               args.opacity, params, Path(args.output))
+
+
+if __name__ == "__main__":
+    main()

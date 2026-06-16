@@ -1,0 +1,14 @@
+# Abweichungen vom Default fuer die Heatmap-Erstellung.
+#
+# Praezedenz: eingebauter Default < config.toml < explizites CLI-Argument.
+# (Ein per CLI gesetztes Flag, z. B. --falloff hard, ueberschreibt diese Datei.)
+#
+# Die Datenquelle (--input) und die Ausgabe (--output) stehen bewusst NICHT hier:
+#   - im CI ueber das GitHub-Secret SHEET_URL
+#   - lokal in start.bat
+
+falloff = "soft"        # Kreisform: hard | soft | plateau (Default: hard)
+resolution_km = 5       # Rasteraufloesung in km fuer Bild UND Tooltips (Default: 5)
+opacity = 0.7           # Deckkraft der Heatmap-Ebene 0..1 (Default: 0.3)
+value_filled = 3        # Kreiswert bei befuellter Gewichtungs-Spalte (Default: 2)
+value_empty = 1         # Kreiswert bei leerer Gewichtungs-Spalte (Default: 1)

@@ -1,0 +1,67 @@
+name: Heatmap bauen & auf Pages veroeffentlichen
+
+on:
+  # Bei Code-/Config-Aenderungen neu bauen.
+  push:
+    branches: [main]
+  # Vom Google Apps Script ausgeloest, wenn sich das Sheet aendert
+  # (siehe apps_script/Code.gs).
+  repository_dispatch:
+    types: [sheet-updated]
+  # Manueller Button im Actions-Tab (zum Testen).
+  workflow_dispatch:
+
+# Rechte fuer das offizielle GitHub-Pages-Deployment.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Nur ein Pages-Deploy gleichzeitig; laufende werden nicht abgebrochen.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Heruntergeladene Geodaten (GeoNames-PLZ + Deutschland-Umriss) cachen,
+      # damit data_sources.py sie nicht bei jedem Lauf neu zieht.
+      - name: Geodaten-Cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: geodata-v1
+
+      - name: Abhaengigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Heatmap erzeugen
+        env:
+          SHEET_URL: ${{ secrets.SHEET_URL }}
+        run: python heatmap.py --input "$SHEET_URL" --output public/index.html
+
+      - name: Pages-Artefakt hochladen
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Auf GitHub Pages veroeffentlichen
+        id: deployment
+        uses: actions/deploy-pages@v4
