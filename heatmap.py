@@ -36,6 +36,16 @@ import data_sources
 # Mittlere Erdgroessen fuer die metrische Umrechnung von Grad <-> km.
 KM_PER_DEG_LAT = 111.32
 
+
+def _mercator_y(lat_deg):
+    """Web-Mercator-Y (in Grad) fuer eine geographische Breite."""
+    return np.degrees(np.arcsinh(np.tan(np.radians(lat_deg))))
+
+
+def _inv_mercator_y(y_deg):
+    """Umkehrung von _mercator_y: Mercator-Y (Grad) -> geographische Breite."""
+    return np.degrees(np.arctan(np.sinh(np.radians(y_deg))))
+
 # Kontrastreicher Farbverlauf der Heatmap: Fraktion (0..1) -> RGB.
 # Dunkelblau -> Hellblau -> Gelb -> Orange -> Rot -> Dunkelrot.
 _COLOR_STOPS = [
@@ -278,23 +288,27 @@ def surface_to_rgba(surface: np.ndarray, vmin: float, vmax: float) -> np.ndarray
     return np.flipud(rgba)
 
 
-def build_hover_layer(value_grid, count_grid, lons, lats, boundary,
+def build_hover_layer(value_grid, count_grid, lons, lats, lat_edges, boundary,
                       name="Werte (Mouseover)", show=True):
     """Transparentes, hover-bares Gitter, deckungsgleich mit dem Bildraster.
 
     Zeigt pro Rasterzelle einen Tooltip 'Wertigkeit (Personen)', z.B.
-    ``12.0 (8)``. Es wird genau eine Zelle pro Bildraster-Zelle erzeugt (gleiche
-    Aufloesung wie ``resolution_km``), damit Tooltips und Heatmap exakt
-    uebereinstimmen. ``name``/``show`` steuern Beschriftung und Default-
-    Sichtbarkeit in der LayerControl.
+    ``12.0 (8)``. Genau eine Zelle pro Bildraster-Zelle (gleiche Aufloesung wie
+    ``resolution_km``).
+
+    Wichtig: Die Latitude-Kanten der Zellen kommen aus ``lat_edges`` (Laenge
+    ``len(lats)+1``) und folgen den **Mercator-Baendern** des Bild-Overlays
+    (``mercator_project``). Nur so liegen die Hover-Rahmen deckungsgleich auf den
+    Farbzellen - gleichmaessige Grad-Rechtecke wuerden zu den Polen hin
+    auseinanderlaufen. Die Laenge (x) ist linear, daher gleichmaessige Zellen.
     """
     dlon = lons[1] - lons[0]
-    dlat = lats[1] - lats[0]
-    half_w, half_h = dlon / 2, dlat / 2
+    half_w = dlon / 2
 
     features = []
     for ilat in range(len(lats)):
         clat = float(lats[ilat])
+        south, north = float(lat_edges[ilat]), float(lat_edges[ilat + 1])
         for ilon in range(len(lons)):
             count = int(count_grid[ilat, ilon])
             if count <= 0:
@@ -311,11 +325,11 @@ def build_hover_layer(value_grid, count_grid, lons, lats, boundary,
                 "geometry": {
                     "type": "Polygon",
                     "coordinates": [[
-                        [clon - half_w, clat - half_h],
-                        [clon + half_w, clat - half_h],
-                        [clon + half_w, clat + half_h],
-                        [clon - half_w, clat + half_h],
-                        [clon - half_w, clat - half_h],
+                        [clon - half_w, south],
+                        [clon + half_w, south],
+                        [clon + half_w, north],
+                        [clon - half_w, north],
+                        [clon - half_w, south],
                     ]],
                 },
             })
@@ -425,10 +439,20 @@ def render_map(
     # Erweiterung ist der Versatz ~0 km ueber ganz Deutschland.
     dlon = float(lons[1] - lons[0])
     dlat = float(lats[1] - lats[0])
+    lat_lo, lat_hi = lat_min - dlat / 2, lat_max + dlat / 2
     img_bounds = [
-        [lat_min - dlat / 2, lon_min - dlon / 2],
+        [lat_lo, lon_min - dlon / 2],
         [lat_max + dlat / 2, lon_max + dlon / 2],
     ]
+
+    # Latitude-Kanten der Hover-Zellen entlang der Mercator-Baender des Bildes
+    # (mercator_project teilt [lat_lo, lat_hi] gleichmaessig in Mercator-Y).
+    # So sitzen die Hover-Rahmen deckungsgleich auf den Farbzellen.
+    n_lat = len(lats)
+    merc_edges = (_mercator_y(lat_lo)
+                  + np.arange(n_lat + 1) / n_lat
+                  * (_mercator_y(lat_hi) - _mercator_y(lat_lo)))
+    lat_edges = _inv_mercator_y(merc_edges)
 
     fmap = folium.Map(location=center, zoom_start=6, tiles="OpenStreetMap")
 
@@ -452,7 +476,7 @@ def render_map(
         ).add_to(fmap)
 
         hover_layer, n_cells = build_hover_layer(
-            spec["surface"], spec["count_grid"], lons, lats, boundary,
+            spec["surface"], spec["count_grid"], lons, lats, lat_edges, boundary,
             name=spec["hover_name"], show=spec["show"],
         )
         hover_layer.add_to(fmap)
