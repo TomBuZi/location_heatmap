@@ -412,19 +412,33 @@ def render_map(
     lat_min, lat_max = float(lats[0]), float(lats[-1])
     center = [(lat_min + lat_max) / 2, (lon_min + lon_max) / 2]
 
-    # Bild-Bounds nur in der Laenge (x) um eine halbe Zelle erweitern, damit die
-    # Pixel-Mittelpunkte auf den Rasterpunkten lons[i] liegen (Leaflet streckt das
-    # Bild dort linear -> sonst halber-Pixel-Versatz zu den Hover-Polygonen).
-    # Die Breite (y) wird NICHT erweitert: dort uebernimmt mercator_project die
-    # Zeilen-Zuordnung anhand der Rasterpunkte lats[j]; eine Erweiterung wuerde
-    # einen nach Nord/Sued wachsenden Versatz erzeugen.
+    # Bild-Bounds in BEIDEN Achsen um eine halbe Zelle erweitern, damit die
+    # Pixel-Mittelpunkte exakt auf den Rasterpunkten lons[i]/lats[j] liegen -
+    # deckungsgleich mit den dort zentrierten Hover-Polygonen.
+    #   * Laenge (x): Leaflet streckt das Bild linear -> ohne Erweiterung
+    #     halber-Pixel-Versatz.
+    #   * Breite (y): mercator_project interpretiert die Bounds als die AEUSSEREN
+    #     Kanten des Bildes (Zeilen-Zentren liegen eine halbe Zelle innerhalb).
+    #     Ohne Erweiterung landen die Zeilen daher um bis zu eine halbe Zelle
+    #     daneben -> nach Nord/Sued wachsender Versatz.
+    # Numerisch durch die folium-mercator_transform-Pipeline verifiziert: mit
+    # Erweiterung ist der Versatz ~0 km ueber ganz Deutschland.
     dlon = float(lons[1] - lons[0])
+    dlat = float(lats[1] - lats[0])
     img_bounds = [
-        [lat_min, lon_min - dlon / 2],
-        [lat_max, lon_max + dlon / 2],
+        [lat_min - dlat / 2, lon_min - dlon / 2],
+        [lat_max + dlat / 2, lon_max + dlon / 2],
     ]
 
     fmap = folium.Map(location=center, zoom_start=6, tiles="OpenStreetMap")
+
+    # Die HTML wird haeufig neu erzeugt -> Browser-Cache unterbinden, damit nach
+    # einem neuen Build nicht versehentlich eine veraltete Karte angezeigt wird.
+    fmap.get_root().header.add_child(folium.Element(
+        '<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">'
+        '<meta http-equiv="Pragma" content="no-cache">'
+        '<meta http-equiv="Expires" content="0">'
+    ))
 
     for spec in layers:
         rgba = surface_to_rgba(spec["surface"], spec["vmin"], spec["vmax"])
