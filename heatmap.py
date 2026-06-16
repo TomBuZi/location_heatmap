@@ -23,6 +23,7 @@ import sys
 import tomllib
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import branca.colormap as cm
 import folium
@@ -556,7 +557,8 @@ def main(argv=None) -> None:
         "n_points": len(points),
         "vmin": vmin,
         "vmax": vmax,
-        "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        # Feste Zeitzone Europe/Berlin, da der CI-Lauf sonst UTC anzeigen wuerde.
+        "created": datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d %H:%M %Z"),
         "source": source_label,
     }
     render_map(surface, count_grid, lons, lats, vmin, vmax, boundary,
