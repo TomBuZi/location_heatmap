@@ -412,13 +412,23 @@ def render_map(
     lat_min, lat_max = float(lats[0]), float(lats[-1])
     center = [(lat_min + lat_max) / 2, (lon_min + lon_max) / 2]
 
+    # Bild-Bounds um eine halbe Zelle erweitern, damit die Pixel-Mittelpunkte
+    # genau auf den Rasterpunkten lons[i]/lats[j] liegen - also deckungsgleich mit
+    # den dort zentrierten Hover-Polygonen (sonst halber-Pixel-Versatz).
+    dlon = float(lons[1] - lons[0])
+    dlat = float(lats[1] - lats[0])
+    img_bounds = [
+        [lat_min - dlat / 2, lon_min - dlon / 2],
+        [lat_max + dlat / 2, lon_max + dlon / 2],
+    ]
+
     fmap = folium.Map(location=center, zoom_start=6, tiles="OpenStreetMap")
 
     for spec in layers:
         rgba = surface_to_rgba(spec["surface"], spec["vmin"], spec["vmax"])
         folium.raster_layers.ImageOverlay(
             image=rgba,
-            bounds=[[lat_min, lon_min], [lat_max, lon_max]],
+            bounds=img_bounds,
             opacity=opacity,
             mercator_project=True,
             name=spec["name"],
