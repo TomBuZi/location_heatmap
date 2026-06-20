@@ -468,65 +468,102 @@ def _make_colormap(vmin: float, vmax: float, caption: str):
     )
 
 
-class BindColormap(MacroElement):
-    """Koppelt die Sichtbarkeit einer Farbskala an einen Layer.
+class LayerRadioControl(MacroElement):
+    """Eigene Layer-Auswahl als Radio-Buttons (immer genau eine Ebene aktiv).
 
-    Beim Ein-/Ausblenden des Layers (LayerControl) wird die zugehoerige
-    branca-Farbskala per Leaflet-Event mit ein- bzw. ausgeblendet, sodass immer
-    nur die Legende(n) der aktuell sichtbaren Ebene(n) erscheint. Die
-    Anfangs-Sichtbarkeit richtet sich nach ``visible`` (Default-Anzeige).
+    Ersetzt folium's ``LayerControl`` samt der frueheren Event-Bindings fuer
+    Legende und Parameter-Panel. Gruende fuer eine Eigenbau-Loesung:
+
+    * Leaflet rendert Radio-Buttons nur fuer *Base-Layer*, nicht fuer Overlays;
+      die Ebenen als Base-Layer zu deklarieren wuerde mit dem OSM-Kachel-Layer
+      kollidieren.
+    * ``LayerControl(collapsed=...)`` ist ein fester Boolean, nicht
+      viewport-abhaengig - "Desktop offen / Mobil eingeklappt" waere nicht moeglich.
+
+    Auf dem Desktop ist die Radio-Liste dauerhaft sichtbar (oben rechts), auf
+    schmalen Bildschirmen klappt sie ein Button bei Bedarf auf.
+
+    ``entries`` ist eine Liste von Dicts mit ``layer`` (FeatureGroup),
+    ``colormap`` (branca-Farbskala), ``box_id`` (DOM-id des Parameter-Panels)
+    und ``name`` (Anzeigename). ``active`` ist der Index der initial aktiven Ebene.
+
+    Da programmatisches ``map.addLayer/removeLayer`` *kein*
+    ``overlayadd/overlayremove`` ausloest, steuert dieser Control Legende und
+    Parameter-Panel direkt mit.
     """
 
-    def __init__(self, layer, colormap, visible: bool):
+    def __init__(self, entries: list[dict], active: int = 0):
         super().__init__()
-        self.layer = layer
-        self.colormap = colormap
-        self.visible = visible
+        self.entries = entries
+        self.active = active
         self._template = Template("""
-        {% macro script(this, kwargs) %}
-            {{this.colormap.get_name()}}.svg[0][0].style.display =
-                '{{ "block" if this.visible else "none" }}';
-            {{this._parent.get_name()}}.on('overlayadd', function (e) {
-                if (e.layer == {{this.layer.get_name()}}) {
-                    {{this.colormap.get_name()}}.svg[0][0].style.display = 'block';
-                }});
-            {{this._parent.get_name()}}.on('overlayremove', function (e) {
-                if (e.layer == {{this.layer.get_name()}}) {
-                    {{this.colormap.get_name()}}.svg[0][0].style.display = 'none';
-                }});
+        {% macro header(this, kwargs) %}
+        <style>
+            #layer-radio {
+                position: fixed; top: 10px; right: 10px; z-index: 9999;
+                background: rgba(255,255,255,0.92); border: 1px solid #999;
+                border-radius: 6px; padding: 8px 10px; font-size: 13px;
+                font-family: Arial, sans-serif; color: #222; line-height: 1.4;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+            }
+            #layer-radio .title { font-weight: 700; margin-bottom: 4px; }
+            #layer-radio label { display: block; cursor: pointer; white-space: nowrap; }
+            #layer-radio input { margin-right: 6px; }
+            #layer-radio-toggle {
+                display: none; cursor: pointer; border: none; background: none;
+                font-size: 16px; font-weight: 700; padding: 0; line-height: 1;
+                font-family: Arial, sans-serif; color: #222;
+            }
+            @media (max-width: 768px) {
+                #layer-radio-toggle { display: block; }
+                #layer-radio-list.collapsed { display: none; }
+            }
+        </style>
         {% endmacro %}
-        """)
 
+        {% macro html(this, kwargs) %}
+        <div id="layer-radio">
+            <button id="layer-radio-toggle" title="Ebene waehlen">&#9776; Ebene</button>
+            <div id="layer-radio-list" class="collapsed">
+                <div class="title">Ebene</div>
+                {% for e in this.entries %}
+                <label><input type="radio" name="layer" value="{{ loop.index0 }}"
+                    {%- if loop.index0 == this.active %} checked{% endif %}> {{ e.name }}</label>
+                {% endfor %}
+            </div>
+        </div>
+        {% endmacro %}
 
-class BindParamBox(MacroElement):
-    """Koppelt die Sichtbarkeit eines Parameter-Panels (per DOM-id) an einen Layer.
-
-    Analog zu :class:`BindColormap`, aber fuer das fest positionierte Info-Panel:
-    beim Ein-/Ausblenden des Layers wird das passende Panel (``box_id``) gezeigt
-    bzw. versteckt, sodass die layerspezifischen Angaben immer zur Karte passen.
-    """
-
-    def __init__(self, layer, box_id: str, visible: bool):
-        super().__init__()
-        self.layer = layer
-        self.box_id = box_id
-        self.visible = visible
-        self._template = Template("""
         {% macro script(this, kwargs) %}
-            (function() {
-                var box = document.getElementById('{{this.box_id}}');
-                if (box) box.style.display = '{{ "block" if this.visible else "none" }}';
-                {{this._parent.get_name()}}.on('overlayadd', function (e) {
-                    if (e.layer == {{this.layer.get_name()}}) {
-                        var b = document.getElementById('{{this.box_id}}');
-                        if (b) b.style.display = 'block';
-                    }});
-                {{this._parent.get_name()}}.on('overlayremove', function (e) {
-                    if (e.layer == {{this.layer.get_name()}}) {
-                        var b = document.getElementById('{{this.box_id}}');
-                        if (b) b.style.display = 'none';
-                    }});
-            })();
+        (function() {
+            var map = {{ this._parent.get_name() }};
+            var layers = [{% for e in this.entries %}{{ e.layer.get_name() }}{% if not loop.last %}, {% endif %}{% endfor %}];
+            var legends = [{% for e in this.entries %}{{ e.colormap.get_name() }}.svg[0][0]{% if not loop.last %}, {% endif %}{% endfor %}];
+            var boxIds = [{% for e in this.entries %}'{{ e.box_id }}'{% if not loop.last %}, {% endif %}{% endfor %}];
+
+            function selectLayer(idx) {
+                for (var i = 0; i < layers.length; i++) {
+                    var on = (i === idx);
+                    if (on) { map.addLayer(layers[i]); } else { map.removeLayer(layers[i]); }
+                    if (legends[i]) legends[i].style.display = on ? 'block' : 'none';
+                    var box = document.getElementById(boxIds[i]);
+                    if (box) box.style.display = on ? 'block' : 'none';
+                }
+            }
+
+            var radios = document.querySelectorAll('#layer-radio input[name="layer"]');
+            for (var r = 0; r < radios.length; r++) {
+                radios[r].addEventListener('change', function() {
+                    if (this.checked) selectLayer(parseInt(this.value, 10));
+                });
+            }
+            var toggle = document.getElementById('layer-radio-toggle');
+            var list = document.getElementById('layer-radio-list');
+            if (toggle && list) {
+                toggle.addEventListener('click', function() { list.classList.toggle('collapsed'); });
+            }
+            selectLayer({{ this.active }});
+        })();
         {% endmacro %}
         """)
 
@@ -577,18 +614,18 @@ def render_map(
                       "vmin": spec["vmin"], "vmax": spec["vmax"]}
         add_param_box(fmap, box_params, box_id, spec["show"])
 
-        bindings.append((layer, colormap, box_id, spec["show"]))
+        bindings.append({"layer": layer, "colormap": colormap,
+                         "box_id": box_id, "name": spec["name"],
+                         "show": spec["show"]})
 
         print(f"Layer '{spec['name']}': Wertebereich {spec['vmin']:.1f} .. "
               f"{spec['vmax']:.1f}, {n_cells} Zellen, {n_top} Top-Wert-Zelle(n).")
 
-    folium.LayerControl().add_to(fmap)
-
-    # Legende UND Parameter-Panel je Layer koppeln -> es ist immer nur die
-    # Legende/Box der aktuell sichtbaren Ebene(n) zu sehen.
-    for layer, colormap, box_id, show in bindings:
-        fmap.add_child(BindColormap(layer, colormap, show))
-        fmap.add_child(BindParamBox(layer, box_id, show))
+    # Eigene Radio-Auswahl (statt folium.LayerControl): immer genau eine Ebene
+    # aktiv; Legende und Parameter-Panel werden passend mitgesteuert. Aktive
+    # Ebene = erste mit show=True (Fallback: die erste Ebene).
+    active = next((i for i, b in enumerate(bindings) if b["show"]), 0)
+    fmap.add_child(LayerRadioControl(bindings, active))
 
     output.parent.mkdir(parents=True, exist_ok=True)
     fmap.save(str(output))
