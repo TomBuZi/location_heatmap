@@ -483,6 +483,11 @@ class LayerRadioControl(MacroElement):
     Auf dem Desktop ist die Radio-Liste dauerhaft sichtbar (oben rechts), auf
     schmalen Bildschirmen klappt sie ein Button bei Bedarf auf.
 
+    Das Panel wird als echter Leaflet-Control (``position: 'topright'``) erzeugt,
+    nicht als frei positioniertes Div - dadurch stapelt Leaflet es konfliktfrei
+    unter der Farbskala-Legende (die ebenfalls oben rechts sitzt), statt sie zu
+    ueberdecken.
+
     ``entries`` ist eine Liste von Dicts mit ``layer`` (FeatureGroup),
     ``colormap`` (branca-Farbskala), ``box_id`` (DOM-id des Parameter-Panels)
     und ``name`` (Anzeigename). ``active`` ist der Index der initial aktiven Ebene.
@@ -499,16 +504,15 @@ class LayerRadioControl(MacroElement):
         self._template = Template("""
         {% macro header(this, kwargs) %}
         <style>
-            #layer-radio {
-                position: fixed; top: 10px; right: 10px; z-index: 9999;
+            .layer-radio {
                 background: rgba(255,255,255,0.92); border: 1px solid #999;
                 border-radius: 6px; padding: 8px 10px; font-size: 13px;
                 font-family: Arial, sans-serif; color: #222; line-height: 1.4;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.3);
             }
-            #layer-radio .title { font-weight: 700; margin-bottom: 4px; }
-            #layer-radio label { display: block; cursor: pointer; white-space: nowrap; }
-            #layer-radio input { margin-right: 6px; }
+            .layer-radio .title { font-weight: 700; margin-bottom: 4px; }
+            .layer-radio label { display: block; cursor: pointer; white-space: nowrap; }
+            .layer-radio input { margin-right: 6px; }
             #layer-radio-toggle {
                 display: none; cursor: pointer; border: none; background: none;
                 font-size: 16px; font-weight: 700; padding: 0; line-height: 1;
@@ -521,25 +525,31 @@ class LayerRadioControl(MacroElement):
         </style>
         {% endmacro %}
 
-        {% macro html(this, kwargs) %}
-        <div id="layer-radio">
-            <button id="layer-radio-toggle" title="Ebene waehlen">&#9776; Ebene</button>
-            <div id="layer-radio-list" class="collapsed">
-                <div class="title">Ebene</div>
-                {% for e in this.entries %}
-                <label><input type="radio" name="layer" value="{{ loop.index0 }}"
-                    {%- if loop.index0 == this.active %} checked{% endif %}> {{ e.name }}</label>
-                {% endfor %}
-            </div>
-        </div>
-        {% endmacro %}
-
         {% macro script(this, kwargs) %}
         (function() {
             var map = {{ this._parent.get_name() }};
             var layers = [{% for e in this.entries %}{{ e.layer.get_name() }}{% if not loop.last %}, {% endif %}{% endfor %}];
             var legends = [{% for e in this.entries %}{{ e.colormap.get_name() }}.svg[0][0]{% if not loop.last %}, {% endif %}{% endfor %}];
             var boxIds = [{% for e in this.entries %}'{{ e.box_id }}'{% if not loop.last %}, {% endif %}{% endfor %}];
+            var names = [{% for e in this.entries %}{{ e.name | tojson }}{% if not loop.last %}, {% endif %}{% endfor %}];
+            var active = {{ this.active }};
+
+            var ctl = L.control({position: 'topright'});
+            ctl.onAdd = function() {
+                var div = L.DomUtil.create('div', 'layer-radio leaflet-control');
+                var h = '<button id="layer-radio-toggle" title="Ebene waehlen">&#9776; Ebene</button>'
+                      + '<div id="layer-radio-list" class="collapsed"><div class="title">Ebene</div>';
+                for (var i = 0; i < names.length; i++) {
+                    h += '<label><input type="radio" name="layer" value="' + i + '"'
+                       + (i === active ? ' checked' : '') + '> ' + names[i] + '</label>';
+                }
+                h += '</div>';
+                div.innerHTML = h;
+                L.DomEvent.disableClickPropagation(div);
+                L.DomEvent.disableScrollPropagation(div);
+                return div;
+            };
+            ctl.addTo(map);
 
             function selectLayer(idx) {
                 for (var i = 0; i < layers.length; i++) {
@@ -551,7 +561,7 @@ class LayerRadioControl(MacroElement):
                 }
             }
 
-            var radios = document.querySelectorAll('#layer-radio input[name="layer"]');
+            var radios = document.querySelectorAll('.layer-radio input[name="layer"]');
             for (var r = 0; r < radios.length; r++) {
                 radios[r].addEventListener('change', function() {
                     if (this.checked) selectLayer(parseInt(this.value, 10));
@@ -562,7 +572,7 @@ class LayerRadioControl(MacroElement):
             if (toggle && list) {
                 toggle.addEventListener('click', function() { list.classList.toggle('collapsed'); });
             }
-            selectLayer({{ this.active }});
+            selectLayer(active);
         })();
         {% endmacro %}
         """)
