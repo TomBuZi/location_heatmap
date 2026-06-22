@@ -776,6 +776,12 @@ def main(argv=None) -> None:
     surface_sp = mask_to_germany(grid_sp, lons, lats, boundary)
     vmin_sp, vmax_sp = occupied_range(surface_sp)
 
+    # Reine Personenanzahl: wie viele Personen koennen die Zelle erreichen
+    # (dist <= radius). Keine Gewichtung, kein Falloff - das ist genau die harte
+    # Mitgliedschaft aus ``count_grid``, unabhaengig von --falloff.
+    surface_cnt = mask_to_germany(count_grid.astype(np.float32), lons, lats, boundary)
+    vmin_cnt, vmax_cnt = occupied_range(surface_cnt)
+
     # Warnung, falls die Tooltip-Ebene (eine Zelle je belegter Rasterzelle) sehr
     # gross wird -> aufgeblaehte, traege HTML. Schwelle grob, als oberer Schaetzer.
     hover_cells = int((count_grid > 0).sum())
@@ -824,6 +830,13 @@ def main(argv=None) -> None:
             "vmin": vmin_sp, "vmax": vmax_sp,
             "name": "Reise-Heatmap (Treffen-Gewichtung)",
             "caption": f"Grundwert 1 + 1 je besuchtem Treffen (max {args.value_special_max:g})",
+            "show": False,
+        },
+        {
+            "surface": surface_cnt, "count_grid": count_grid,
+            "vmin": vmin_cnt, "vmax": vmax_cnt,
+            "name": "Reise-Heatmap (Personenanzahl)",
+            "caption": "Anzahl Personen, die den Punkt erreichen koennen (Min..Max)",
             "show": False,
         },
     ]
